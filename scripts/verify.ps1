@@ -1,4 +1,4 @@
-param(
+﻿param(
     [int]$Port = 18888,
     [string]$VerifyToken = "verify-token"
 )
@@ -110,15 +110,43 @@ try {
     Invoke-RestMethod -Uri "$base/api/v1/repo/status" -Method Get -Headers $headers | Out-Host
 
     Write-Host "[verify] protocols"
-    Invoke-RestMethod -Uri "$base/api/v1/protocols" -Method Get | Out-Host
+    $protocolsResp = Invoke-RestMethod -Uri "$base/api/v1/protocols?node_ip=edge.example.com" -Method Get
+    $protocolIds = @()
+    if ($null -ne $protocolsResp) {
+        if ($protocolsResp -is [System.Collections.IEnumerable] -and -not ($protocolsResp -is [string])) {
+            foreach ($proto in $protocolsResp) {
+                if ($proto.PSObject.Properties.Name -contains "id" -and $proto.id) {
+                    $protocolIds += [string]$proto.id
+                }
+            }
+        } elseif ($protocolsResp.PSObject.Properties.Name -contains "id" -and $protocolsResp.id) {
+            $protocolIds += [string]$protocolsResp.id
+        }
+    }
+    if ($protocolIds.Count -eq 0) {
+        throw "protocol list extraction failed"
+    }
+    $protocolsResp | ConvertTo-Json -Depth 10 | Out-Host
 
-    Write-Host "[verify] subscribe verify"
-    Invoke-RestMethod -Uri "$base/api/v1/subscribe/verify?token=$VerifyToken" -Method Get | Out-Host
+    Write-Host "[verify] protocol matrix generation"
+    foreach ($protocolId in $protocolIds) {
+        $pidEncoded = [uri]::EscapeDataString($protocolId)
+        $gen = Invoke-RestMethod -Uri "$base/api/v1/local/generate.sh?node_name=proto-$pidEncoded&node_ip=203.0.113.10&use_singbox=true&use_mihomo=true&selected_protocols=$pidEncoded" -Method Get
+        $text = [string]$gen
+        if ($text -notmatch "^#!/usr/bin/env bash") {
+            throw "protocol generate failed: $protocolId"
+        }
+        if ($text -notmatch "vpn233-node") {
+            throw "protocol generate script missing helper marker: $protocolId"
+        }
+    }
 
     Write-Host "[verify] protocols include nekotls"
-    $protocols = Invoke-RestMethod -Uri "$base/api/v1/protocols" -Method Get
-    if (-not ($protocols.id -contains "singbox-nekotls")) {
-        throw "nekotls missing from catalog"
+    if (-not ($protocolIds -contains "singbox-nekotls")) {
+        throw "singbox-nekotls missing from catalog"
+    }
+    if (-not ($protocolIds -contains "mihomo-nekotls")) {
+        throw "mihomo-nekotls missing from catalog"
     }
 
     Write-Host "[verify] subscribe convert clash-meta-nekotls"
@@ -131,7 +159,7 @@ try {
     Write-Host "[verify] node generation features"
     $gen = Invoke-RestMethod -Uri "$base/api/v1/local/generate.sh?node_name=v&node_ip=edge.example.com&enable_acme=true&acme_domain=edge.example.com&selected_protocols=singbox-nekotls" -Method Get
     foreach ($kw in @("tune_performance", "apply_security_hardening", "install_watchdog", "issue_acme_cert")) {
-        if ("$gen" -notmatch [regex]::Escape($kw)) {
+        if ([string]$gen -notmatch [regex]::Escape($kw)) {
             throw "generated node script missing $kw"
         }
     }
@@ -140,7 +168,7 @@ try {
     Write-Host "[verify] proxysss gateway yaml"
     $gateway = Invoke-RestMethod -Uri "$base/api/v1/local/gateway/proxysss.yaml" -Method Get
     foreach ($kw in @("challenge: dns01", "provider: cloudflare", "name: vpn233-provider-panel")) {
-        if ("$gateway" -notmatch [regex]::Escape($kw)) {
+        if ([string]$gateway -notmatch [regex]::Escape($kw)) {
             throw "proxysss gateway plan missing $kw"
         }
     }

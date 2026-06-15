@@ -26,6 +26,8 @@ import (
 	"sync"
 	"text/template"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 type ServerConfig struct {
@@ -87,6 +89,7 @@ type InstallRequest struct {
 	UUID              string   `json:"uuid"`
 	Password          string   `json:"password"`
 	SelectedProtocols []string `json:"selected_protocols"`
+	ProtocolOptions   map[string]map[string]any `json:"protocol_options"`
 }
 
 type AuthRequest struct {
@@ -95,10 +98,11 @@ type AuthRequest struct {
 }
 
 type ProtocolPort struct {
-	ID   string
-	Name string
-	Core string
-	Port int
+	ID      string
+	Name    string
+	Core    string
+	Port    int
+	Options map[string]any `json:"options,omitempty"`
 }
 
 type generateResult struct {
@@ -591,6 +595,8 @@ func runCLIGenerate(state *AppState, stdout io.Writer, args []string) error {
 	acmeEmail := fs.String("acme-email", "", "ACME registration email")
 	tcpCongestion := fs.String("tcp-congestion", "", "TCP congestion control (bbr|cubic|...)")
 	connLimit := fs.Int("conn-limit", 0, "open file/connection limit (nofile)")
+	protocolOptionsJSON := fs.String("protocol-options", "", "protocol options JSON keyed by protocol id")
+	protocolOptionsB64 := fs.String("protocol-options-b64", "", "base64 JSON keyed by protocol id")
 
 	var useMihomo optionalBool
 	var useSingbox optionalBool
@@ -684,6 +690,20 @@ func runCLIGenerate(state *AppState, stdout io.Writer, args []string) error {
 	}
 	if *connLimit > 0 {
 		req.ConnLimit = *connLimit
+	}
+	if *protocolOptionsJSON != "" {
+		options, err := parseProtocolOptions(*protocolOptionsJSON)
+		if err != nil {
+			return fmt.Errorf("parse --protocol-options failed: %w", err)
+		}
+		req.ProtocolOptions = mergeProtocolOptions(req.ProtocolOptions, options)
+	}
+	if *protocolOptionsB64 != "" {
+		options, err := parseProtocolOptionsB64(*protocolOptionsB64)
+		if err != nil {
+			return fmt.Errorf("parse --protocol-options-b64 failed: %w", err)
+		}
+		req.ProtocolOptions = mergeProtocolOptions(req.ProtocolOptions, options)
 	}
 	if len(req.SelectedProtocols) == 0 {
 		req.SelectedProtocols = defaultProtocolIDsForStrategy(
@@ -1109,7 +1129,8 @@ func (a *AppState) generateHandler(w http.ResponseWriter, r *http.Request) {
 		}
 		writeJSON(w, http.StatusOK, res)
 	case http.MethodGet:
-		a.generateRawArtifact(w, r, "")
+		// GET defaults to plain shell for one-click server consumption.
+		a.generateRawArtifact(w, r, strings.TrimSpace(r.URL.Query().Get("format")))
 	default:
 		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "only GET/POST"})
 	}
@@ -1130,8 +1151,11 @@ func (a *AppState) generateRawArtifact(w http.ResponseWriter, r *http.Request, f
 	if format == "" {
 		format = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
 	}
-	if format != "sh" && format != "ps1" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "format must be sh or ps1"})
+	if format == "" {
+		format = "sh"
+	}
+	if format != "sh" && format != "ps1" && format != "json" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "format must be sh, ps1 or json"})
 		return
 	}
 	req, err := parseInstallRequestFromQuery(r)
@@ -1145,6 +1169,10 @@ func (a *AppState) generateRawArtifact(w http.ResponseWriter, r *http.Request, f
 		return
 	}
 	filename := sanitizeFileName(res.Node.Name)
+	if format == "json" {
+		writeJSON(w, http.StatusOK, res)
+		return
+	}
 	if format == "sh" {
 		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-install.sh\"", filename))
 		writeText(w, http.StatusOK, res.Shell)
@@ -1280,10 +1308,11 @@ func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error)
 			nextPort += 11
 		}
 		mapping = append(mapping, ProtocolPort{
-			ID:   p.ID,
-			Name: p.Name,
-			Core: p.Core,
-			Port: port,
+			ID:      p.ID,
+			Name:    p.Name,
+			Core:    p.Core,
+			Port:    port,
+			Options: cloneProtocolOptions(profile.ProtocolOptions, p.ID),
 		})
 	}
 	profile.PortMap = mapping
@@ -1438,6 +1467,7 @@ type normalizedRequest struct {
 	TCPCongestion             string
 	ConnLimit                 int
 	SelectedProtocols         []string
+	ProtocolOptions           map[string]map[string]any
 	PortMap                   []ProtocolPort
 }
 
@@ -1515,6 +1545,7 @@ func normalizeRequest(req InstallRequest, cfg ServerConfig) (normalizedRequest, 
 	} else {
 		out.EnableACME = out.ACMEDomain != "" && endpointStrategy(out.NodeIP) == "domain"
 	}
+	out.ProtocolOptions = cloneProtocolOptionsMap(req.ProtocolOptions)
 	out.AdminPassword = req.AdminPassword
 	if req.AdminPassword != "" {
 		out.Password = req.AdminPassword
@@ -1702,43 +1733,12 @@ func buildConnectionLinks(req normalizedRequest, ports []ProtocolPort) []string 
 }
 
 func connectionLinkForProtocol(req normalizedRequest, p ProtocolPort) string {
-	switch p.ID {
-	case "singbox-vless":
-		return fmt.Sprintf("vless://%s@%s:%d?security=none&type=tcp#%s", req.UUID, req.NodeIP, p.Port, p.Name)
-	case "singbox-vless-grpc":
-		return fmt.Sprintf("vless://%s@%s:%d?security=tls&sni=%s&type=grpc&serviceName=%s#%s", req.UUID, req.NodeIP, p.Port, req.ServerName, req.GRPCServiceName, p.Name)
-	case "singbox-vless-reality":
-		return fmt.Sprintf("vless://%s@%s:%d?security=reality&sni=%s&pbk=%s&sid=%s&type=tcp#%s", req.UUID, req.NodeIP, p.Port, req.RealityServer, req.RealityPublicKey, req.RealityShortID, p.Name)
-	case "singbox-vless-reality-grpc":
-		return fmt.Sprintf("vless://%s@%s:%d?security=reality&sni=%s&pbk=%s&sid=%s&type=grpc&serviceName=%s#%s", req.UUID, req.NodeIP, p.Port, req.RealityServer, req.RealityPublicKey, req.RealityShortID, req.GRPCServiceName, p.Name)
-	case "singbox-anytls":
-		return fmt.Sprintf("anytls://%s@%s:%d/?sni=%s&insecure=1#%s", req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
-	case "singbox-nekotls":
-		return nekotlsLink(req, p)
-	case "singbox-vmess":
-		return vmessLink(req.NodeIP, p.Port, req.UUID, "", "", false)
-	case "singbox-vmess-ws":
-		return vmessLink(req.NodeIP, p.Port, req.UUID, "/vpn233-vmess", req.ServerName, true)
-	case "singbox-trojan":
-		return fmt.Sprintf("trojan://%s@%s:%d?sni=%s#%s", req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
-	case "singbox-trojan-grpc":
-		return fmt.Sprintf("trojan://%s@%s:%d?sni=%s&type=grpc&serviceName=%s#%s", req.Password, req.NodeIP, p.Port, req.ServerName, req.GRPCServiceName, p.Name)
-	case "singbox-shadowsocks":
-		userInfo := base64.StdEncoding.EncodeToString([]byte("2022-blake3-chacha20-poly1305:" + req.Password))
-		return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, req.NodeIP, p.Port, p.Name)
-	case "singbox-hysteria2":
-		return fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1#%s", req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
-	case "singbox-tuic":
-		return fmt.Sprintf("tuic://%s:%s@%s:%d?sni=%s&congestion_control=bbr#%s", req.UUID, req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
-	case "singbox-wireguard":
-		return fmt.Sprintf("wireguard://%s@%s:%d?publickey=%s&presharedkey=%s&address=%s#%s", req.WireGuardClientPrivateKey, req.NodeIP, p.Port, req.WireGuardServerPublicKey, req.WireGuardPresharedKey, req.WireGuardClientCIDR, p.Name)
-	case "singbox-socks":
-		return fmt.Sprintf("socks5://vpn233:%s@%s:%d#%s", req.Password, req.NodeIP, p.Port, p.Name)
-	case "singbox-http":
-		return fmt.Sprintf("http://vpn233:%s@%s:%d#%s", req.Password, req.NodeIP, p.Port, p.Name)
-	default:
-		return ""
+	if strat, ok := protocolStrategyForID(p.ID); ok && strat.connectionLink != nil {
+		if link := strat.connectionLink(req, p); link != "" {
+			return link
+		}
 	}
+	return ""
 }
 
 func vmessLink(host string, port int, uuid, pathValue, serverName string, tlsEnabled bool) string {
@@ -1834,179 +1834,17 @@ func buildSingBoxConfig(req normalizedRequest, ports []ProtocolPort) (string, er
 }
 
 func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, error) {
-	switch p.ID {
-	case "singbox-vless":
-		return singBoxInboundVLESS(p.Port, req.UUID), nil
-	case "singbox-vless-grpc":
-		inbound := singBoxInboundVLESS(p.Port, req.UUID)
-		inbound["tag"] = "vless-grpc-" + fmt.Sprintf("%d", p.Port)
-		inbound["tls"] = singBoxTLSConfig(req, []string{"h2", "http/1.1"})
-		inbound["transport"] = grpcTransport(req)
+	if strat, ok := protocolStrategyForID(p.ID); ok && strat.singboxInbound != nil {
+		inbound, err := strat.singboxInbound(req, p)
+		if err != nil {
+			return nil, err
+		}
+		if len(p.Options) > 0 {
+			inbound = deepMergeStringAnyMaps(inbound, p.Options)
+		}
 		return inbound, nil
-	case "singbox-vless-reality":
-		inbound := singBoxInboundVLESS(p.Port, req.UUID)
-		inbound["tag"] = "vless-reality-" + fmt.Sprintf("%d", p.Port)
-		inbound["tls"] = singBoxRealityConfig(req, []string{"h2", "http/1.1"})
-		return inbound, nil
-	case "singbox-vless-reality-grpc":
-		inbound := singBoxInboundVLESS(p.Port, req.UUID)
-		inbound["tag"] = "vless-reality-grpc-" + fmt.Sprintf("%d", p.Port)
-		inbound["tls"] = singBoxRealityConfig(req, []string{"h2", "http/1.1"})
-		inbound["transport"] = grpcTransport(req)
-		return inbound, nil
-	case "singbox-anytls":
-		return map[string]any{
-			"type":        "anytls",
-			"tag":         "anytls-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{
-					"name":     "vpn233",
-					"password": req.Password,
-				},
-			},
-			"padding_scheme": []string{},
-			"tls":            singBoxTLSConfig(req, []string{"h2", "http/1.1"}),
-		}, nil
-	case "singbox-nekotls":
-		return singBoxNekoTLSInbound(req, p), nil
-	case "singbox-vmess":
-		return map[string]any{
-			"type":        "vmess",
-			"tag":         "vmess-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{
-					"uuid":    req.UUID,
-					"alterId": 0,
-				},
-			},
-			"proxy_protocol": false,
-		}, nil
-	case "singbox-vmess-ws":
-		return map[string]any{
-			"type":        "vmess",
-			"tag":         "vmess-ws-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{
-					"uuid":    req.UUID,
-					"alterId": 0,
-				},
-			},
-			"tls":       singBoxTLSConfig(req, []string{"http/1.1"}),
-			"transport": wsTransport("/vpn233-vmess", req.ServerName),
-		}, nil
-	case "singbox-trojan":
-		return map[string]any{
-			"type":        "trojan",
-			"tag":         "trojan-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{
-					"name":     "admin",
-					"password": req.Password,
-				},
-			},
-			"tls": singBoxTLSConfig(req, []string{"h2", "http/1.1"}),
-		}, nil
-	case "singbox-trojan-grpc":
-		return map[string]any{
-			"type":        "trojan",
-			"tag":         "trojan-grpc-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{
-					"name":     "admin",
-					"password": req.Password,
-				},
-			},
-			"tls":       singBoxTLSConfig(req, []string{"h2", "http/1.1"}),
-			"transport": grpcTransport(req),
-		}, nil
-	case "singbox-shadowsocks":
-		return map[string]any{
-			"type":        "shadowsocks",
-			"tag":         "ss-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"method":      "2022-blake3-chacha20-poly1305",
-			"password":    req.Password,
-		}, nil
-	case "singbox-hysteria2":
-		return map[string]any{
-			"type":        "hysteria2",
-			"tag":         "hysteria2-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"up_mbps":     100,
-			"down_mbps":   1000,
-			"users": []any{
-				map[string]any{"password": req.Password},
-			},
-			"tls": singBoxTLSConfig(req, []string{"h3"}),
-		}, nil
-	case "singbox-tuic":
-		return map[string]any{
-			"type":        "tuic",
-			"tag":         "tuic-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{
-					"uuid":     req.UUID,
-					"password": req.Password,
-				},
-			},
-			"congestion_control": "bbr",
-			"zero_rtt_handshake": false,
-			"tls":                singBoxTLSConfig(req, []string{"h3"}),
-		}, nil
-	case "singbox-wireguard":
-		return map[string]any{
-			"type":        "wireguard",
-			"tag":         "wg-" + fmt.Sprintf("%d", p.Port),
-			"listen_port": p.Port,
-			"address":     []string{req.WireGuardServerCIDR},
-			"private_key": req.WireGuardServerPrivateKey,
-			"mtu":         1408,
-			"peers": []any{
-				map[string]any{
-					"public_key":     req.WireGuardClientPublicKey,
-					"pre_shared_key": req.WireGuardPresharedKey,
-					"allowed_ips":    []string{req.WireGuardClientCIDR},
-				},
-			},
-		}, nil
-	case "singbox-socks":
-		return map[string]any{
-			"type":        "socks",
-			"tag":         "socks-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{"username": "vpn233", "password": req.Password},
-			},
-			"udp": true,
-		}, nil
-	case "singbox-http":
-		return map[string]any{
-			"type":        "http",
-			"tag":         "http-" + fmt.Sprintf("%d", p.Port),
-			"listen":      "::",
-			"listen_port": p.Port,
-			"users": []any{
-				map[string]any{"username": "vpn233", "password": req.Password},
-			},
-		}, nil
-	default:
-		return nil, fmt.Errorf("unsupported singbox protocol: %s", p.ID)
 	}
+	return nil, fmt.Errorf("unsupported singbox protocol: %s", p.ID)
 }
 
 func singBoxInboundVLESS(port int, uuid string) map[string]any {
@@ -2169,174 +2007,17 @@ func mihomoProxyName(p ProtocolPort) string {
 }
 
 func mihomoProxyLines(req normalizedRequest, p ProtocolPort, name string) ([]string, error) {
-	server := yamlQuote(req.NodeIP)
-	switch p.ID {
-	case "mihomo-vless":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: vless",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
-			"    udp: true",
-			"    tls: false",
-		}, nil
-	case "mihomo-vless-grpc":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: vless",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
-			"    udp: true",
-			"    tls: true",
-			fmt.Sprintf("    servername: %s", yamlQuote(req.ServerName)),
-			"    skip-cert-verify: true",
-			"    network: grpc",
-			"    grpc-opts:",
-			fmt.Sprintf("      grpc-service-name: %s", yamlQuote(req.GRPCServiceName)),
-		}, nil
-	case "mihomo-vless-reality-grpc":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: vless",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
-			"    udp: true",
-			"    tls: true",
-			fmt.Sprintf("    servername: %s", yamlQuote(req.RealityServer)),
-			"    client-fingerprint: chrome",
-			"    network: grpc",
-			"    grpc-opts:",
-			fmt.Sprintf("      grpc-service-name: %s", yamlQuote(req.GRPCServiceName)),
-			"    reality-opts:",
-			fmt.Sprintf("      public-key: %s", yamlQuote(req.RealityPublicKey)),
-			fmt.Sprintf("      short-id: %s", yamlQuote(req.RealityShortID)),
-		}, nil
-	case "mihomo-anytls":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: anytls",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
-			"    udp: true",
-			"    client-fingerprint: chrome",
-			"    idle-session-check-interval: 30",
-			"    idle-session-timeout: 30",
-			"    min-idle-session: 0",
-			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
-			"    skip-cert-verify: true",
-		}, nil
-	case "mihomo-nekotls":
-		return renderNekoTLSYAMLLines(nekotlsProxyMap(req, p.Port, name)), nil
-	case "mihomo-vmess":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: vmess",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
-			"    alterId: 0",
-			"    cipher: auto",
-			"    udp: true",
-			"    tls: false",
-		}, nil
-	case "mihomo-vmess-ws":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: vmess",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
-			"    alterId: 0",
-			"    cipher: auto",
-			"    udp: true",
-			"    tls: true",
-			fmt.Sprintf("    servername: %s", yamlQuote(req.ServerName)),
-			"    skip-cert-verify: true",
-			"    network: ws",
-			"    ws-opts:",
-			"      path: /vpn233-vmess",
-			"      headers:",
-			fmt.Sprintf("        Host: %s", yamlQuote(req.ServerName)),
-		}, nil
-	case "mihomo-trojan":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: trojan",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
-			"    udp: true",
-			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
-			"    skip-cert-verify: true",
-		}, nil
-	case "mihomo-trojan-grpc":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: trojan",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
-			"    udp: true",
-			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
-			"    skip-cert-verify: true",
-			"    network: grpc",
-			"    grpc-opts:",
-			fmt.Sprintf("      grpc-service-name: %s", yamlQuote(req.GRPCServiceName)),
-		}, nil
-	case "mihomo-shadowsocks":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: ss",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			"    cipher: 2022-blake3-chacha20-poly1305",
-			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
-			"    udp: true",
-		}, nil
-	case "mihomo-hysteria2":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: hysteria2",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
-			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
-			"    skip-cert-verify: true",
-			"    udp: true",
-		}, nil
-	case "mihomo-tuic":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: tuic",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
-			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
-			"    udp: true",
-			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
-			"    skip-cert-verify: true",
-			"    congestion-controller: bbr",
-		}, nil
-	case "mihomo-wireguard":
-		return []string{
-			fmt.Sprintf("  - name: %s", yamlQuote(name)),
-			"    type: wireguard",
-			fmt.Sprintf("    server: %s", server),
-			fmt.Sprintf("    port: %d", p.Port),
-			fmt.Sprintf("    ip: %s", yamlQuote(req.WireGuardClientCIDR)),
-			fmt.Sprintf("    private-key: %s", yamlQuote(req.WireGuardClientPrivateKey)),
-			fmt.Sprintf("    public-key: %s", yamlQuote(req.WireGuardServerPublicKey)),
-			fmt.Sprintf("    pre-shared-key: %s", yamlQuote(req.WireGuardPresharedKey)),
-			"    udp: true",
-			"    mtu: 1408",
-		}, nil
-	default:
-		return nil, fmt.Errorf("unsupported mihomo protocol: %s", p.ID)
+	if strat, ok := protocolStrategyForID(p.ID); ok && strat.mihomoProxyLines != nil {
+		lines, err := strat.mihomoProxyLines(req, p, name)
+		if err != nil {
+			return nil, err
+		}
+		if len(p.Options) == 0 {
+			return lines, nil
+		}
+		return applyMihomoOptionOverrides(lines, p.Options)
 	}
+	return nil, fmt.Errorf("unsupported mihomo protocol: %s", p.ID)
 }
 
 func parseInstallRequestFromQuery(r *http.Request) (InstallRequest, error) {
@@ -2414,6 +2095,22 @@ func parseInstallRequestFromQuery(r *http.Request) (InstallRequest, error) {
 			}
 		}
 	}
+	rawProtocolOptions := strings.TrimSpace(r.URL.Query().Get("protocol_options"))
+	if rawProtocolOptions != "" {
+		options, err := parseProtocolOptions(rawProtocolOptions)
+		if err != nil {
+			return InstallRequest{}, fmt.Errorf("bad protocol_options: %w", err)
+		}
+		req.ProtocolOptions = mergeProtocolOptions(req.ProtocolOptions, options)
+	}
+	rawProtocolOptionsB64 := strings.TrimSpace(r.URL.Query().Get("protocol_options_b64"))
+	if rawProtocolOptionsB64 != "" {
+		options, err := parseProtocolOptionsB64(rawProtocolOptionsB64)
+		if err != nil {
+			return InstallRequest{}, fmt.Errorf("bad protocol_options_b64: %w", err)
+		}
+		req.ProtocolOptions = mergeProtocolOptions(req.ProtocolOptions, options)
+	}
 	return req, nil
 }
 
@@ -2456,6 +2153,185 @@ func normalizeServerName(host string) string {
 	host = strings.ToLower(host)
 	host = strings.ReplaceAll(host, "_", "-")
 	return host
+}
+
+func applyMihomoOptionOverrides(lines []string, overrides map[string]any) ([]string, error) {
+	cleaned := make([]string, 0, len(lines))
+	for _, line := range lines {
+		line = strings.ReplaceAll(line, "\t", "  ")
+		if len(cleaned) == 0 && strings.TrimSpace(line) == "" {
+			continue
+		}
+		cleaned = append(cleaned, line)
+	}
+	for len(cleaned) > 0 && strings.TrimSpace(cleaned[len(cleaned)-1]) == "" {
+		cleaned = cleaned[:len(cleaned)-1]
+	}
+	if len(cleaned) == 0 {
+		return nil, fmt.Errorf("empty mihomo proxy block")
+	}
+	joined := strings.Join(cleaned, "\n")
+	if joined == "" {
+		return nil, fmt.Errorf("empty mihomo proxy block")
+	}
+	if len(overrides) == 0 {
+		return lines, nil
+	}
+
+	var decoded []map[string]any
+	if err := yaml.Unmarshal([]byte(joined), &decoded); err != nil {
+		var fallback map[string]any
+		if fallbackErr := yaml.Unmarshal([]byte(joined), &fallback); fallbackErr != nil {
+			return nil, fmt.Errorf("parse mihomo proxy lines: %w", err)
+		}
+		decoded = []map[string]any{fallback}
+	}
+	if len(decoded) == 0 {
+		return nil, fmt.Errorf("mihomo proxy block is empty")
+	}
+
+	out := make([]string, 0, len(decoded))
+	for _, item := range decoded {
+		if item == nil {
+			continue
+		}
+		merged := deepMergeStringAnyMaps(item, overrides)
+		raw, err := yaml.Marshal(merged)
+		if err != nil {
+			return nil, fmt.Errorf("marshal mihomo proxy override: %w", err)
+		}
+		for i, row := range strings.Split(strings.TrimRight(string(raw), "\n"), "\n") {
+			if i == 0 {
+				out = append(out, "  - "+row)
+				continue
+			}
+			out = append(out, "    "+row)
+		}
+	}
+	return out, nil
+}
+
+func cloneProtocolOptionsMap(source map[string]map[string]any) map[string]map[string]any {
+	if len(source) == 0 {
+		return nil
+	}
+	out := make(map[string]map[string]any, len(source))
+	for id, options := range source {
+		if options == nil {
+			out[id] = make(map[string]any)
+			continue
+		}
+		out[id] = deepCloneStringAnyMap(options)
+	}
+	return out
+}
+
+func cloneProtocolOptions(source map[string]map[string]any, protocolID string) map[string]any {
+	options, ok := source[protocolID]
+	if !ok || len(options) == 0 {
+		return nil
+	}
+	return deepCloneStringAnyMap(options)
+}
+
+func mergeProtocolOptions(target, override map[string]map[string]any) map[string]map[string]any {
+	out := cloneProtocolOptionsMap(target)
+	if override == nil {
+		return out
+	}
+	if out == nil {
+		out = make(map[string]map[string]any)
+	}
+	for protocolID, options := range override {
+		if _, ok := out[protocolID]; !ok {
+			out[protocolID] = deepCloneStringAnyMap(options)
+			continue
+		}
+		out[protocolID] = deepMergeStringAnyMaps(out[protocolID], options)
+	}
+	return out
+}
+
+func deepCloneStringAnyMap(in map[string]any) map[string]any {
+	out := make(map[string]any, len(in))
+	for k, v := range in {
+		out[k] = deepClone(v)
+	}
+	return out
+}
+
+func deepClone(v any) any {
+	switch t := v.(type) {
+	case map[string]any:
+		return deepCloneStringAnyMap(t)
+	case []any:
+		out := make([]any, len(t))
+		for i := range t {
+			out[i] = deepClone(t[i])
+		}
+		return out
+	default:
+		return v
+	}
+}
+
+func deepMergeStringAnyMaps(base, overrides map[string]any) map[string]any {
+	if len(overrides) == 0 {
+		return deepCloneStringAnyMap(base)
+	}
+	out := deepCloneStringAnyMap(base)
+	for k, override := range overrides {
+		if override == nil {
+			out[k] = nil
+			continue
+		}
+		baseValue, ok := out[k]
+		if ok {
+			baseMap, baseIsMap := baseValue.(map[string]any)
+			overrideMap, overrideIsMap := override.(map[string]any)
+			if baseIsMap && overrideIsMap {
+				out[k] = deepMergeStringAnyMaps(baseMap, overrideMap)
+				continue
+			}
+		}
+		out[k] = deepClone(override)
+	}
+	return out
+}
+
+func parseProtocolOptions(raw string) (map[string]map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	var payload map[string]any
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, fmt.Errorf("bad protocol_options json: %w", err)
+	}
+	out := make(map[string]map[string]any, len(payload))
+	for protocolID, value := range payload {
+		m, ok := value.(map[string]any)
+		if !ok {
+			return nil, fmt.Errorf("bad protocol_options: %s must be an object", protocolID)
+		}
+		out[protocolID] = deepCloneStringAnyMap(m)
+	}
+	return out, nil
+}
+
+func parseProtocolOptionsB64(raw string) (map[string]map[string]any, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil, nil
+	}
+	decoded, err := base64.StdEncoding.DecodeString(raw)
+	if err != nil {
+		decoded, err = base64.RawURLEncoding.DecodeString(raw)
+		if err != nil {
+			return nil, fmt.Errorf("bad protocol_options_b64: %w", err)
+		}
+	}
+	return parseProtocolOptions(string(decoded))
 }
 
 func yamlQuote(raw string) string {

@@ -105,7 +105,7 @@ powershell -ExecutionPolicy Bypass -File .\install-server.ps1
 - `GET /api/v1/config`
 - `POST /api/v1/config`
 - `POST /api/v1/generate`
-- `GET /api/v1/generate?format=sh|ps1`
+- `GET /api/v1/generate`（默认返回 bash 脚本，可通过 `format=sh|ps1|json` 指定）
 - `GET /api/v1/generate.sh`
 - `GET /api/v1/generate.ps1`
 - `GET /api/v1/repo/status`（管理认证）
@@ -145,6 +145,8 @@ powershell -ExecutionPolicy Bypass -File .\install-server.ps1
 | `enable_acme=true\|false` | 有域名时默认开 | 申请 Let's Encrypt 正式证书 |
 | `acme_domain=<domain>` | 空 | ACME 证书域名 |
 | `acme_email=<email>` | 自动生成 | ACME 注册邮箱 |
+| `protocol_options=<json>` | 空 | 按协议透传参数（协议 id -> 配置对象） |
+| `protocol_options_b64=<base64>` | 空 | `protocol_options` 的 base64 编码 |
 
 示例：
 
@@ -152,6 +154,20 @@ powershell -ExecutionPolicy Bypass -File .\install-server.ps1
 curl -sL -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:8080/api/v1/generate?format=sh&node_name=edge-a&node_ip=203.0.113.8&use_singbox=true&use_mihomo=true&selected_protocols=singbox-vless-grpc,singbox-vless-reality-grpc,mihomo-vless-grpc" \
   -o edge-a-install.sh
+```
+
+同样可以直接访问 `GET /api/v1/generate` 获取原始脚本（推荐用于一键傻瓜化部署）：
+
+```bash
+curl -sL "http://127.0.0.1:8080/api/v1/generate?node_name=edge-a&node_ip=203.0.113.9&use_singbox=true&use_mihomo=false&selected_protocols=singbox-nekotls" -o edge-a-install.sh
+```
+
+按协议透传示例（可用于快速压测每个协议的定制字段）：
+
+```bash
+curl -sL -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:8080/api/v1/generate?format=sh&node_name=edge-b&node_ip=203.0.113.9&use_singbox=true&use_mihomo=true&selected_protocols=singbox-vless,mihomo-vless&protocol_options=%7B%22singbox-vless%22%3A%7B%22tag%22%3A%22prod-vless%22%2C%22outbound_users%22%3A%7B%22flow%22%3A%22xtls-rprx-vision%22%7D%7D%2C%22mihomo-vless%22%3A%7B%22network%22%3A%22tcp%22%2C%22ws-opts%22%3A%7B%22path%22%3A%22%2Fedge%22%7D%7D%7D" \
+  -o edge-b-install.sh
 ```
 
 ## 订阅验收接口 `/api/v1/subscribe/verify`
@@ -189,7 +205,21 @@ curl "http://127.0.0.1:8080/api/v1/subscribe/verify?token=VERIFY_TOKEN"
     "singbox-vmess",
     "singbox-trojan",
     "singbox-shadowsocks"
-  ]
+  ],
+  "protocol_options": {
+    "singbox-vless": {
+      "tag": "prod-vless",
+      "outbound_users": {
+        "flow": "xtls-rprx-vision"
+      }
+    },
+    "mihomo-vless": {
+      "network": "tcp",
+      "ws-opts": {
+        "path": "/edge"
+      }
+    }
+  }
 }
 ```
 
@@ -419,6 +449,57 @@ go test ./...
 - 生成 `proxysss` 网关 YAML 并断言含 `challenge: dns01` / `provider: cloudflare`
 - 清理服务进程
 
+### 真机 SSH 验收（8.163.25.145）
+
+项目提供 `scripts/verify-remote.sh`，用于对真实主机进行端到端验收（服务启动、登录鉴权、订阅联调、协议脚本回放、proxysss 网关生成）。脚本会先把“当前本地工作区快照”打包上传到远端临时目录，再在远端执行验证，因此验收结果直接对应你准备发布的这份代码，而不是远端旧分支。
+
+```bash
+# 口令方式（推荐在临时测试机执行）
+VPN233_REMOTE_HOST=8.163.25.145 \
+VPN233_REMOTE_USER=root \
+VPN233_REMOTE_PASSWORD='YOUR_PASSWORD' \
+VPN233_REMOTE_VERIFY_TOKEN='verify-token' \
+bash scripts/verify-remote.sh
+```
+
+```powershell
+# 口令方式（PowerShell）
+$env:VPN233_REMOTE_HOST='8.163.25.145'
+$env:VPN233_REMOTE_USER='root'
+$env:VPN233_REMOTE_PASSWORD='YOUR_PASSWORD'
+$env:VPN233_REMOTE_VERIFY_TOKEN='verify-token'
+powershell -File scripts/verify-remote.ps1
+```
+
+```bash
+# 或使用 SSH key（推荐）
+VPN233_REMOTE_HOST=8.163.25.145 \
+VPN233_REMOTE_USER=root \
+bash scripts/verify-remote.sh
+```
+
+```powershell
+# 或使用 SSH key（PowerShell）
+$env:VPN233_REMOTE_HOST='8.163.25.145'
+$env:VPN233_REMOTE_USER='root'
+powershell -File scripts/verify-remote.ps1
+```
+
+可配置环境变量：
+
+- `VPN233_REMOTE_HOST`：目标 IP 或主机名，默认 `8.163.25.145`
+- `VPN233_REMOTE_PORT`：SSH 端口，默认 `22`
+- `VPN233_REMOTE_USER`：SSH 用户，默认 `root`
+- `VPN233_REMOTE_PASSWORD`：SSH 密码（未设置则走 SSH key 或交互登录）
+- `VPN233_REMOTE_DIR`：远端工作目录，默认 `/tmp/vpn233-provider-verify`
+- `VPN233_REMOTE_VERIFY_PORT`：验收服务端口，默认 `18888`
+- `VPN233_REMOTE_VERIFY_TOKEN`：订阅联调 token，默认 `verify-token`
+- `VPN233_REMOTE_VERIFY_TIMEOUT`：健康检查超时秒数，默认 `30`
+
+注意：若提供了 `VPN233_REMOTE_PASSWORD`，PowerShell 版会优先使用 `Posh-SSH`，未安装 `sshpass` 时可通过 `Install-Module Posh-SSH` 安装。`sshpass` 版 `verify-remote.sh` 仍可直接使用。若两者都不可用，密码登录会直接报错并停止。
+
+脚本成功返回 `[remote-verify] ok` 表示该主机验收通过，并会输出关键日志片段。
+
 ### Shell 脚本语法校验
 
 `scripts/syntax-check.sh` / `scripts/syntax-check.ps1` 会生成一个最大化安装脚本并对“外层安装器”与“内嵌 `vpn233-node` 管理 CLI”分别运行 `bash -n` 语法检查（Windows 需 Git Bash）。同样的校验也内置于 `go test`（`TestGeneratedShellIsValidBash`，无 bash 时自动跳过）。
@@ -467,6 +548,7 @@ go run . generate --format sh --node-name edge-01 --node-ip 203.0.113.10
 --enable-logrotate=<bool>     --enable-watchdog=<bool>
 --enable-acme=<bool>     --acme-domain <domain>  --acme-email <email>
 --tcp-congestion <bbr|cubic|...>  --conn-limit <n>
+--protocol-options <json>  --protocol-options-b64 <base64>
 ```
 
 支持的核心子命令：

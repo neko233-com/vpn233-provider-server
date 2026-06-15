@@ -5,10 +5,42 @@ PORT="${VPN233_VERIFY_PORT:-18888}"
 VERIFY_TOKEN="${VPN233_VERIFY_TOKEN:-verify-token}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
-CFG_FILE="$TMP_DIR/server.yaml"
 LOG_FILE="$TMP_DIR/server.log"
-ORIG_CFG="$ROOT_DIR/server.yaml"
-BACKUP_CFG=""
+
+cleanup() {
+  if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
+    kill "$SERVER_PID" 2>/dev/null || true
+    wait "$SERVER_PID" 2>/dev/null || true
+  fi
+  rm -rf "$TMP_DIR"
+}
+trap cleanup EXIT
+
+is_port_open() {
+  local port="$1"
+  (echo > /dev/tcp/127.0.0.1/"$port") >/dev/null 2>&1
+}
+
+pick_free_port() {
+  local p="$1"
+  local limit=$((p + 60))
+  while (( p <= limit )); do
+    if ! is_port_open "$p"; then
+      echo "$p"
+      return 0
+    fi
+    p=$((p + 1))
+  done
+  return 1
+}
+
+FREE_PORT="$(pick_free_port "$PORT")"
+if [[ -z "$FREE_PORT" ]]; then
+  echo "[verify] no free port around $PORT"
+  exit 1
+fi
+PORT="$FREE_PORT"
+CFG_FILE="$(mktemp "${TMP_DIR}/server-XXXXXX.yaml")"
 
 cat >"$CFG_FILE" <<YAML
 listen_addr: "127.0.0.1"
@@ -42,35 +74,21 @@ dns_automation:
   create_wildcard: true
 YAML
 
-cleanup() {
-  if [[ -n "$BACKUP_CFG" ]] && [[ -f "$BACKUP_CFG" ]]; then
-    mv -f "$BACKUP_CFG" "$ORIG_CFG"
-  elif [[ -f "$ORIG_CFG" ]] && [[ ! -f "$TMP_DIR/server.yaml.orig" ]]; then
-    rm -f "$ORIG_CFG"
-  fi
-  if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
-    kill "$SERVER_PID" 2>/dev/null || true
-    wait "$SERVER_PID" 2>/dev/null || true
-  fi
-  rm -rf "$TMP_DIR"
-}
-trap cleanup EXIT
-
 echo "[verify] run tests"
 go test ./...
-
-if [[ -f "$ORIG_CFG" ]]; then
-  cp "$ORIG_CFG" "$TMP_DIR/server.yaml.orig"
-  BACKUP_CFG="$TMP_DIR/server.yaml.orig"
-fi
-cp "$CFG_FILE" "$ORIG_CFG"
 
 echo "[verify] start provider server"
 (
   cd "$ROOT_DIR"
-  go run . >"$LOG_FILE" 2>&1
+  VPN233_CONFIG_PATH="$CFG_FILE" go run . >"$LOG_FILE" 2>&1
 ) &
 SERVER_PID=$!
+sleep 0.3
+if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+  echo "[verify] server process exited unexpectedly"
+  cat "$LOG_FILE"
+  exit 1
+fi
 
 for i in $(seq 1 30); do
   if curl -sf "http://127.0.0.1:$PORT/api/v1/health" >/dev/null; then
@@ -97,17 +115,35 @@ echo "[verify] repo status"
 curl -sf -H "Authorization: Bearer $TOKEN" "http://127.0.0.1:$PORT/api/v1/repo/status" | head -n 1
 
 echo "[verify] protocols"
-curl -sf "http://127.0.0.1:$PORT/api/v1/protocols" | head -n 1
+PROTO_JSON=$(curl -sf "http://127.0.0.1:$PORT/api/v1/protocols?node_ip=edge.example.com")
+echo "$PROTO_JSON" | head -n 1
+if ! echo "$PROTO_JSON" | grep -q '"id":"singbox-nekotls"' || ! echo "$PROTO_JSON" | grep -q '"id":"mihomo-nekotls"'; then
+  echo "[verify] protocol catalog from API does not include NekoTLS templates"
+  exit 1
+fi
+PROTO_IDS=($(echo "$PROTO_JSON" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p'))
+if (( ${#PROTO_IDS[@]} == 0 )); then
+  echo "[verify] protocol catalog extraction failed"
+  exit 1
+fi
+echo "[verify] protocol matrix generation"
+for pid in "${PROTO_IDS[@]}"; do
+  SAMPLE=$(curl -fs "http://127.0.0.1:$PORT/api/v1/local/generate.sh?node_name=proto-${pid}&node_ip=203.0.113.10&use_singbox=true&use_mihomo=true&selected_protocols=${pid}")
+  echo "$SAMPLE" | head -n 1 | grep -q "#!/usr/bin/env bash" || { echo "[verify] protocol generate failed: $pid"; exit 1; }
+  echo "$SAMPLE" | grep -q "vpn233-node" || { echo "[verify] protocol script missing helper marker: $pid"; exit 1; }
+done
 
 echo "[verify] subscribe verify"
 curl -sf "http://127.0.0.1:$PORT/api/v1/subscribe/verify?token=$VERIFY_TOKEN" | head -n 1
 
 echo "[verify] protocols include nekotls"
-curl -sf "http://127.0.0.1:$PORT/api/v1/protocols" | grep -q "nekotls" || { echo "[verify] nekotls missing from catalog"; exit 1; }
+PROTO_CLI=$(go run . protocols)
+echo "$PROTO_CLI" | grep -Eq '"id"[[:space:]]*:[[:space:]]*"singbox-nekotls"' || { echo "[verify] singbox nekotls missing from catalog"; exit 1; }
+echo "$PROTO_CLI" | grep -Eq '"id"[[:space:]]*:[[:space:]]*"mihomo-nekotls"' || { echo "[verify] mihomo nekotls missing from catalog"; exit 1; }
 
 echo "[verify] subscribe convert clash-meta-nekotls"
 CONVERT=$(curl -sf "http://127.0.0.1:$PORT/api/v1/subscribe/convert?target=clash-meta-nekotls&node_ip=203.0.113.10&use_mihomo=true&token=$VERIFY_TOKEN")
-if ! echo "$CONVERT" | grep -q "type: nekotls"; then
+if ! echo "$CONVERT" | grep -Eq "type:[[:space:]]*nekotls"; then
   echo "[verify] nekotls subscribe conversion missing type: nekotls"
   exit 1
 fi

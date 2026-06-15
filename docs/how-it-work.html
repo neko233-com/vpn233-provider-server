@@ -143,8 +143,8 @@
       <div class="stack">
         <pre id="verifyCurl">curl -s http://127.0.0.1:8080/api/v1/subscribe/verify?token=YOUR_VERIFY_TOKEN | jq .</pre>
       </div>
-      <div class="stack" style="margin-top:10px;">
-        <pre>curl -sL -H "Authorization: Bearer TOKEN" "http://127.0.0.1:8080/api/v1/generate?format=sh&node_name=edge-a&node_ip=203.0.113.8&selected_protocols=singbox-vless-grpc,singbox-vless-reality-grpc,mihomo-vless-grpc" -o edge-a-install.sh</pre>
+        <div class="stack" style="margin-top:10px;">
+        <pre>curl -sL -H "Authorization: Bearer TOKEN" "http://127.0.0.1:8080/api/v1/generate?node_name=edge-a&node_ip=203.0.113.8&selected_protocols=singbox-vless-grpc,singbox-vless-reality-grpc,mihomo-vless-grpc" -o edge-a-install.sh</pre>
       </div>
       <div id="verifySample" class="muted mini"></div>
     </div>
@@ -183,6 +183,30 @@
       <h2>4. Mihomo / Sing-box 协议示例映射</h2>
       <div class="protocol-grid" id="protocolMap"></div>
     </div>
+
+    <div class="card">
+      <h2>5. 协议参数透传技术原理</h2>
+      <p class="muted">所有协议都走统一入口：Provider 在生成阶段为每个出站/入站计算 <code>ProtocolPort.Options</code>，再按核心进行深度合并。</p>
+      <div class="line">
+        <div class="box" style="flex:1;">
+          <b>sing-box 分支</b>
+          <p class="mini muted">策略返回一份标准入站 Map 后，执行 <code>deepMergeStringAnyMaps(inbound, options)</code>，支持层级覆盖（例如 <code>tag_meta</code>）。</p>
+        </div>
+        <div class="box" style="flex:1;">
+          <b>mihomo 分支</b>
+          <p class="mini muted">策略返回 YAML Proxy 行后先反序列化为对象，再用同样的深合并覆盖，最后重排为 <code>proxies[]</code> 片段。</p>
+        </div>
+        <div class="box" style="flex:1;">
+          <b>统一参数入口</b>
+          <p class="mini muted">CLI/Query 使用 <code>protocol_options</code> 或 <code>protocol_options_b64</code>，格式统一为：
+            <code>{"协议id":{"key":value}}</code>。</p>
+        </div>
+      </div>
+      <pre>// singbox: /api/v1/generate?protocol_options={"singbox-vless":{"tag":"vip","tag_meta":{"tier":"gold"}}}
+// mihomo: {"mihomo-vless":{"network":"tcp","ws-opts":{"path":"/edge","headers":{"Host":"edge.example.com"}}}
+
+GET /api/v1/generate?format=sh&node_ip=203.0.113.10&protocol_options_b64=...</pre>
+    </div>
   </div>
 
   <script>
@@ -192,6 +216,8 @@
       { id: "singbox-vless-grpc", name: "VLESS-gRPC", type: "singbox", detail: "自签 TLS + gRPC，适合与 L7 代理协同。", stage: "gRPC 通道" },
       { id: "singbox-vless-reality", name: "VLESS-Reality", type: "singbox", detail: "免域名 Reality，减少证书运维成本。", stage: "Reality 入口" },
       { id: "singbox-vless-reality-grpc", name: "VLESS-Reality-gRPC", type: "singbox", detail: "Reality + gRPC + 重放防护组合模板。", stage: "前沿组合" },
+      { id: "singbox-anytls", name: "AnyTLS", type: "singbox", detail: "域名场景优选协议，配合 TLS 与 ALPN 建立可升级通道。", stage: "AnyTLS 入站" },
+      { id: "singbox-nekotls", name: "NekoTLS", type: "singbox", detail: "NekoTLS 自研包层 + sing-box 原生 AnyTLS 入站，支持 ECH / Reality。", stage: "自研增强层" },
       { id: "singbox-vmess", name: "VMess-TCP", type: "singbox", detail: "历史兼容协议，便于老客户端迁移。", stage: "兼容入口" },
       { id: "singbox-vmess-ws", name: "VMess-WS", type: "singbox", detail: "WebSocket + TLS 组合，兼容旧前端链路。", stage: "WS 通道" },
       { id: "singbox-trojan", name: "Trojan", type: "singbox", detail: "标准 Trojan TLS 入站。", stage: "TLS 伪装" },
@@ -205,6 +231,8 @@
       { id: "mihomo-vless", name: "Mihomo-VLESS", type: "mihomo", detail: "VLESS TCP 出站模板，适合快速接管策略。", stage: "策略模板" },
       { id: "mihomo-vless-grpc", name: "Mihomo-VLESS-gRPC", type: "mihomo", detail: "VLESS gRPC 出站，支持统一 service_name。", stage: "策略模板" },
       { id: "mihomo-vless-reality-grpc", name: "Mihomo-VLESS-Reality-gRPC", type: "mihomo", detail: "Reality 公钥 + ShortID 直接接入。", stage: "Reality 策略" },
+      { id: "mihomo-anytls", name: "Mihomo-AnyTLS", type: "mihomo", detail: "AnyTLS 出站兼容示例，适配可见域名场景。", stage: "AnyTLS 策略" },
+      { id: "mihomo-nekotls", name: "Mihomo-NekoTLS", type: "mihomo", detail: "NekoTLS 自研策略化入组，支持 ECH 与 Reality 互斥切换。", stage: "自研策略" },
       { id: "mihomo-vmess", name: "Mihomo-VMess", type: "mihomo", detail: "VMess TCP 出站。", stage: "策略模板" },
       { id: "mihomo-vmess-ws", name: "Mihomo-VMess-WS", type: "mihomo", detail: "VMess WebSocket 出站模板。", stage: "WS 策略" },
       { id: "mihomo-trojan", name: "Mihomo-Trojan", type: "mihomo", detail: "Trojan TLS 出站模板。", stage: "TLS 策略" },

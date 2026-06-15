@@ -190,6 +190,88 @@ func TestEnsureSubscribeRepoSyncSkipsRootAndTriggersClone(t *testing.T) {
 	}
 }
 
+func TestEnsureSubscribeRepoSyncSkipsRoot(t *testing.T) {
+	temp := t.TempDir()
+	restoreWD := withWorkingDir(t, temp)
+	defer restoreWD()
+
+	var commands []string
+	restoreGit := withGitRunner(t, func(_ string, args ...string) (string, error) {
+		commands = append(commands, strings.Join(args, " "))
+		switch {
+		case args[0] == "rev-parse" && args[1] == "--is-inside-work-tree":
+			return "true", nil
+		case args[0] == "rev-parse" && args[1] == "--show-toplevel":
+			return temp, nil
+		case args[0] == "rev-parse" && args[1] == "--show-superproject-working-tree":
+			return "", nil
+		case args[0] == "rev-parse" && args[1] == "--git-dir":
+			return ".git", nil
+		}
+		return "", nil
+	})
+	defer restoreGit()
+
+	cfg := normalizeRepoDefaults(ServerConfig{})
+	cfg.SubscribeRepoPath = filepath.Join(temp, "anything")
+	check, _, err := ensureSubscribeRepoSync(cfg)
+	if err != nil {
+		t.Fatalf("ensure repo sync should not fail: %v", err)
+	}
+	if check.Action != "skip" {
+		t.Fatalf("expect skip action on root repo, got %s", check.Action)
+	}
+	if check.Status != "skip_root_git" {
+		t.Fatalf("expect skip_root_git status, got %s", check.Status)
+	}
+	for _, c := range commands {
+		if strings.Contains(c, "clone ") || strings.Contains(c, "fetch ") || strings.Contains(c, "reset ") {
+			t.Fatalf("unexpected sync command in root repository: %s", c)
+		}
+	}
+}
+
+func TestEnsureSubscribeRepoSyncSkipsSubmodule(t *testing.T) {
+	temp := t.TempDir()
+	restoreWD := withWorkingDir(t, temp)
+	defer restoreWD()
+
+	var commands []string
+	restoreGit := withGitRunner(t, func(_ string, args ...string) (string, error) {
+		commands = append(commands, strings.Join(args, " "))
+		switch {
+		case args[0] == "rev-parse" && args[1] == "--is-inside-work-tree":
+			return "true", nil
+		case args[0] == "rev-parse" && args[1] == "--show-toplevel":
+			return temp, nil
+		case args[0] == "rev-parse" && args[1] == "--show-superproject-working-tree":
+			return filepath.Join(temp, "super"), nil
+		case args[0] == "rev-parse" && args[1] == "--git-dir":
+			return ".git", nil
+		}
+		return "", nil
+	})
+	defer restoreGit()
+
+	cfg := normalizeRepoDefaults(ServerConfig{})
+	cfg.SubscribeRepoPath = filepath.Join(temp, "nested")
+	check, _, err := ensureSubscribeRepoSync(cfg)
+	if err != nil {
+		t.Fatalf("ensure repo sync should not fail: %v", err)
+	}
+	if check.Action != "skip" {
+		t.Fatalf("expect skip action on submodule, got %s", check.Action)
+	}
+	if check.Status != "submodule" {
+		t.Fatalf("expect submodule status, got %s", check.Status)
+	}
+	for _, c := range commands {
+		if strings.Contains(c, "clone ") || strings.Contains(c, "fetch ") || strings.Contains(c, "reset ") {
+			t.Fatalf("unexpected sync command for submodule: %s", c)
+		}
+	}
+}
+
 func TestSyncRepoByFetchAndClone(t *testing.T) {
 	temp := t.TempDir()
 	repoPath := filepath.Join(temp, "repo")
