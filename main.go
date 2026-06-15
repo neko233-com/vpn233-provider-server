@@ -29,22 +29,22 @@ import (
 )
 
 type ServerConfig struct {
-	ListenAddr           string               `json:"listen_addr" yaml:"listen_addr"`
-	ListenPort           int                  `json:"listen_port" yaml:"listen_port"`
-	AdminUser            string               `json:"admin_user" yaml:"admin_user"`
-	AdminPassword        string               `json:"admin_password" yaml:"admin_password"`
-	DefaultDataDir       string               `json:"default_data_dir" yaml:"default_data_dir"`
-	DefaultNodeIP        string               `json:"default_node_ip" yaml:"default_node_ip"`
-	DefaultPortBase      int                  `json:"default_port_base" yaml:"default_port_base"`
-	DefaultEnableBBR     bool                 `json:"default_enable_bbr" yaml:"default_enable_bbr"`
-	DefaultUseMihomo     bool                 `json:"default_use_mihomo" yaml:"default_use_mihomo"`
-	DefaultUseSingbox    bool                 `json:"default_use_singbox" yaml:"default_use_singbox"`
-	SubscribeRepoURL     string               `json:"subscribe_repo_url" yaml:"subscribe_repo_url"`
-	SubscribeRepoPath    string               `json:"subscribe_repo_path" yaml:"subscribe_repo_path"`
-	SubscribeRepoBranch  string               `json:"subscribe_repo_branch" yaml:"subscribe_repo_branch"`
-	SubscribeVerifyToken string               `json:"subscribe_verify_token" yaml:"subscribe_verify_token"`
+	ListenAddr           string                `json:"listen_addr" yaml:"listen_addr"`
+	ListenPort           int                   `json:"listen_port" yaml:"listen_port"`
+	AdminUser            string                `json:"admin_user" yaml:"admin_user"`
+	AdminPassword        string                `json:"admin_password" yaml:"admin_password"`
+	DefaultDataDir       string                `json:"default_data_dir" yaml:"default_data_dir"`
+	DefaultNodeIP        string                `json:"default_node_ip" yaml:"default_node_ip"`
+	DefaultPortBase      int                   `json:"default_port_base" yaml:"default_port_base"`
+	DefaultEnableBBR     bool                  `json:"default_enable_bbr" yaml:"default_enable_bbr"`
+	DefaultUseMihomo     bool                  `json:"default_use_mihomo" yaml:"default_use_mihomo"`
+	DefaultUseSingbox    bool                  `json:"default_use_singbox" yaml:"default_use_singbox"`
+	SubscribeRepoURL     string                `json:"subscribe_repo_url" yaml:"subscribe_repo_url"`
+	SubscribeRepoPath    string                `json:"subscribe_repo_path" yaml:"subscribe_repo_path"`
+	SubscribeRepoBranch  string                `json:"subscribe_repo_branch" yaml:"subscribe_repo_branch"`
+	SubscribeVerifyToken string                `json:"subscribe_verify_token" yaml:"subscribe_verify_token"`
 	ProxySSS             ProxySSSGatewayConfig `json:"proxysss" yaml:"proxysss"`
-	DNSAutomation        DNSAutomationConfig  `json:"dns_automation" yaml:"dns_automation"`
+	DNSAutomation        DNSAutomationConfig   `json:"dns_automation" yaml:"dns_automation"`
 }
 
 type ProtocolCatalog struct {
