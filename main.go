@@ -1,0 +1,2806 @@
+package main
+
+import (
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/base64"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/pem"
+	"flag"
+	"fmt"
+	"io"
+	"log"
+	"math/big"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"text/template"
+	"time"
+)
+
+type ServerConfig struct {
+	ListenAddr        string `json:"listen_addr"`
+	ListenPort        int    `json:"listen_port"`
+	AdminUser         string `json:"admin_user"`
+	AdminPassword     string `json:"admin_password"`
+	DefaultDataDir    string `json:"default_data_dir"`
+	DefaultNodeIP     string `json:"default_node_ip"`
+	DefaultPortBase   int    `json:"default_port_base"`
+	DefaultEnableBBR  bool   `json:"default_enable_bbr"`
+	DefaultUseMihomo  bool   `json:"default_use_mihomo"`
+	DefaultUseSingbox bool   `json:"default_use_singbox"`
+	SubscribeRepoURL  string `json:"subscribe_repo_url"`
+	SubscribeRepoPath string `json:"subscribe_repo_path"`
+	SubscribeRepoBranch string `json:"subscribe_repo_branch"`
+	SubscribeVerifyToken string `json:"subscribe_verify_token"`
+}
+
+type ProtocolCatalog struct {
+	ID          string `json:"id"`
+	Name        string `json:"name"`
+	Core        string `json:"core"`
+	Description string `json:"description"`
+	Default     bool   `json:"default"`
+}
+
+type InstallRequest struct {
+	NodeName           string   `json:"node_name"`
+	NodeIP             string   `json:"node_ip"`
+	UseMihomo          *bool    `json:"use_mihomo"`
+	UseSingbox         *bool    `json:"use_singbox"`
+	EnableBBR          *bool    `json:"enable_bbr"`
+	PortBase           int      `json:"port_base"`
+	AdminPassword      string   `json:"admin_password"`
+	UUID               string   `json:"uuid"`
+	Password           string   `json:"password"`
+	SelectedProtocols  []string `json:"selected_protocols"`
+}
+
+type AuthRequest struct {
+	Username string `json:"username"`
+	Password string `json:"password"`
+}
+
+type ProtocolPort struct {
+	ID      string
+	Name    string
+	Core    string
+	Port    int
+}
+
+type generateResult struct {
+	Shell string `json:"shell"`
+	PS1   string `json:"ps1"`
+	Node  struct {
+		Name                  string         `json:"name"`
+		NodeIP                string         `json:"node_ip"`
+		ServerName            string         `json:"server_name"`
+		UUID                  string         `json:"uuid"`
+		Password              string         `json:"password"`
+		GRPCServiceName       string         `json:"grpc_service_name"`
+		RealityPublicKey      string         `json:"reality_public_key"`
+		RealityShortID        string         `json:"reality_short_id"`
+		WireGuardClientKey    string         `json:"wireguard_client_private_key"`
+		WireGuardPresharedKey string         `json:"wireguard_preshared_key"`
+		WireGuardClientCIDR   string         `json:"wireguard_client_cidr"`
+		MihomoDir             string         `json:"mihomo_dir"`
+		SingBoxDir            string         `json:"singbox_dir"`
+		Ports                 []ProtocolPort `json:"ports"`
+		Links                 []string       `json:"links"`
+	} `json:"node"`
+}
+
+type AppState struct {
+	mu         sync.RWMutex
+	cfgPath    string
+	cfg        ServerConfig
+	tokenMu    sync.Mutex
+	tokenUntil map[string]time.Time
+}
+
+const dashboardHTML = `<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1.0">
+  <title>vpn233-agent</title>
+  <style>
+    :root {font-family: "Inter", "PingFang SC", "Microsoft YaHei", Arial, sans-serif;background:#0f172a;color:#e2e8f0;}
+    body {margin:0;padding:0;}
+    .wrap{max-width:1080px;margin:0 auto;padding:24px;}
+    h1 {color:#93c5fd;}
+    .card {background:rgba(15,23,42,0.82);border:1px solid #334155;border-radius:12px;padding:16px;margin-bottom:12px;}
+    label{display:block;font-size:14px;margin:6px 0 2px;}
+    input,select,button,textarea{width:100%;box-sizing:border-box;padding:10px;background:#0b1220;color:#e2e8f0;border:1px solid #334155;border-radius:8px;}
+    button{cursor:pointer;font-weight:600;background:#2563eb;border-color:#2563eb;}
+    button:hover{background:#1d4ed8;}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px;}
+    .mono{font-family: ui-monospace, Consolas, monospace;font-size:12px;min-height:220px;}
+    .protocols{display:grid;grid-template-columns:1fr 1fr;gap:8px;}
+    .small{width:auto;padding:6px 12px;}
+    .ok{color:#34d399;}
+    .bad{color:#f87171;}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>VPN233 Agent（傻瓜式一键部署控制台）</h1>
+    <div class="card">
+      <h3>1) 登录</h3>
+      <div class="row">
+        <div><label>用户名</label><input id="u" value="root"></div>
+        <div><label>密码</label><input id="p" type="password" value="root"></div>
+      </div>
+      <button id="loginBtn" class="small">登录</button>
+      <p id="loginMsg"></p>
+    </div>
+
+    <div class="card" id="mainArea" style="display:none;">
+      <h3>2) 节点安装配置</h3>
+      <div class="row">
+        <div><label>节点名</label><input id="nodeName"></div>
+        <div><label>节点 IP（可留空，脚本自动探测）</label><input id="nodeIP" placeholder="auto"></div>
+      </div>
+      <div class="row">
+        <div><label>起始端口</label><input id="portBase" type="number" value="10000"></div>
+        <div><label>管理密码（用于生成 VLESS/Trojan 等）</label><input id="srvPwd" placeholder="auto"></div>
+      </div>
+      <div class="row">
+        <div><label>是否安装 sing-box</label><select id="useSingbox"><option value="true" selected>是</option><option value="false">否</option></select></div>
+        <div><label>是否安装 mihomo（示例模板）</label><select id="useMihomo"><option value="true">是</option><option value="false" selected>否</option></select></div>
+      </div>
+      <label><input type="checkbox" id="enableBBR" checked> 开启 BBR 与常用 TCP 优化</label>
+      <h4>协议选择</h4>
+      <div class="protocols" id="protocolList"></div>
+      <button id="genBtn">生成一键脚本</button>
+      <p id="genMsg"></p>
+      <h4>bash 安装脚本</h4>
+      <textarea id="shellOut" class="mono"></textarea>
+      <button id="copySh" class="small">复制 bash 脚本</button>
+      <h4>PowerShell 安装脚本</h4>
+      <textarea id="psOut" class="mono"></textarea>
+      <button id="copyPs" class="small">复制 PS 脚本</button>
+    </div>
+  </div>
+<script>
+const state = { token:"" };
+const api = (path, opts={}) => {
+  const headers = Object.assign({}, opts.headers||{}, {"Content-Type":"application/json"});
+  if(state.token){ headers.Authorization = "Bearer " + state.token; }
+  return fetch(path, Object.assign({}, opts, {headers}));
+};
+document.getElementById("loginBtn").onclick = async () => {
+  const r = await api("/api/v1/login",{method:"POST", body: JSON.stringify({username:document.getElementById("u").value,password:document.getElementById("p").value})});
+  const j = await r.json();
+  if(!r.ok){document.getElementById("loginMsg").textContent = j.error || "登录失败"; return;}
+  state.token = j.token;
+  document.getElementById("loginMsg").innerHTML = "<span class='ok'>登录成功</span>";
+  document.getElementById("mainArea").style.display = "block";
+  loadProtocols();
+  const c = await (await api("/api/v1/config")).json();
+  if(c.node_name_default) document.getElementById("nodeName").value = c.node_name_default;
+};
+
+const loadProtocols = async () => {
+  const list = document.getElementById("protocolList");
+  list.innerHTML = "加载中...";
+  const r = await api("/api/v1/protocols");
+  const j = await r.json();
+  if(!r.ok){list.textContent = "加载失败"; return;}
+  list.innerHTML = "";
+  j.forEach(p => {
+    const box = document.createElement("label");
+    const id = "p_"+p.id;
+    const checked = p.default ? ' checked' : '';
+    box.innerHTML = '<input type="checkbox" id="' + id + '"' + checked + '> ' + p.name + ' <small>（' + p.core + '）</small>';
+    box.style.border = "1px solid #334155";
+    box.style.borderRadius = "8px";
+    box.style.padding = "8px";
+    list.appendChild(box);
+  });
+};
+
+document.getElementById("genBtn").onclick = async () => {
+  const checked = [];
+  document.querySelectorAll('#protocolList input[type="checkbox"]').forEach(el => {
+    if(el.checked){ checked.push(el.id.replace("p_","")); }
+  });
+  const req = {
+    node_name: document.getElementById("nodeName").value || "vpn233-node",
+    node_ip: document.getElementById("nodeIP").value || "auto",
+    use_singbox: document.getElementById("useSingbox").value === "true",
+    use_mihomo: document.getElementById("useMihomo").value === "true",
+    enable_bbr: document.getElementById("enableBBR").checked,
+    port_base: Number(document.getElementById("portBase").value || 10000),
+    admin_password: document.getElementById("srvPwd").value || "",
+    selected_protocols: checked
+  };
+  const r = await api("/api/v1/generate",{method:"POST", body: JSON.stringify(req)});
+  const j = await r.json();
+  if(!r.ok){document.getElementById("genMsg").textContent = j.error || "生成失败"; return;}
+  document.getElementById("shellOut").value = j.shell || "";
+  document.getElementById("psOut").value = j.ps1 || "";
+  document.getElementById("genMsg").innerHTML = "<span class='ok'>生成成功</span>";
+};
+
+document.getElementById("copySh").onclick = async () => {
+  await navigator.clipboard.writeText(document.getElementById("shellOut").value);
+  document.getElementById("genMsg").textContent = "bash 已复制";
+};
+document.getElementById("copyPs").onclick = async () => {
+  await navigator.clipboard.writeText(document.getElementById("psOut").value);
+  document.getElementById("genMsg").textContent = "ps1 已复制";
+};
+</script>
+</body>
+</html>`
+
+var protocolCatalog = []ProtocolCatalog{
+	{ID: "singbox-vless", Name: "VLESS-TCP", Core: "singbox", Description: "可直接启动的 VLESS TCP 入站", Default: true},
+	{ID: "singbox-vless-grpc", Name: "VLESS-gRPC", Core: "singbox", Description: "自签 TLS + gRPC 服务名模板", Default: true},
+	{ID: "singbox-vless-reality", Name: "VLESS-Reality", Core: "singbox", Description: "Reality TCP 入站，免域名可用", Default: true},
+	{ID: "singbox-vless-reality-grpc", Name: "VLESS-Reality-gRPC", Core: "singbox", Description: "Reality + gRPC + 重放防护参数模板", Default: true},
+	{ID: "singbox-vmess", Name: "VMess-TCP", Core: "singbox", Description: "标准 VMess TCP 入站", Default: false},
+	{ID: "singbox-vmess-ws", Name: "VMess-WS", Core: "singbox", Description: "WS + TLS 入站模板", Default: false},
+	{ID: "singbox-trojan", Name: "Trojan", Core: "singbox", Description: "Trojan TLS 入站模板", Default: true},
+	{ID: "singbox-trojan-grpc", Name: "Trojan-gRPC", Core: "singbox", Description: "Trojan + gRPC 入站模板", Default: false},
+	{ID: "singbox-shadowsocks", Name: "Shadowsocks", Core: "singbox", Description: "Shadowsocks 2022 直出模板", Default: true},
+	{ID: "singbox-hysteria2", Name: "Hysteria2", Core: "singbox", Description: "QUIC/Hysteria2 自签证书模板", Default: false},
+	{ID: "singbox-tuic", Name: "TUIC", Core: "singbox", Description: "TUIC + BBR 模板", Default: false},
+	{ID: "singbox-wireguard", Name: "WireGuard", Core: "singbox", Description: "WireGuard 服务端模板", Default: false},
+	{ID: "singbox-socks", Name: "SOCKS5", Core: "singbox", Description: "带密码的 SOCKS5 入站", Default: false},
+	{ID: "singbox-http", Name: "HTTP", Core: "singbox", Description: "带密码的 HTTP CONNECT 入站", Default: false},
+	{ID: "mihomo-vless", Name: "Mihomo-VLESS", Core: "mihomo", Description: "VLESS TCP 出站管理模板", Default: true},
+	{ID: "mihomo-vless-grpc", Name: "Mihomo-VLESS-gRPC", Core: "mihomo", Description: "VLESS gRPC 出站模板", Default: true},
+	{ID: "mihomo-vless-reality-grpc", Name: "Mihomo-VLESS-Reality-gRPC", Core: "mihomo", Description: "Reality + gRPC 出站模板", Default: true},
+	{ID: "mihomo-vmess", Name: "Mihomo-VMess", Core: "mihomo", Description: "VMess TCP 出站模板", Default: false},
+	{ID: "mihomo-vmess-ws", Name: "Mihomo-VMess-WS", Core: "mihomo", Description: "VMess WS 出站模板", Default: false},
+	{ID: "mihomo-trojan", Name: "Mihomo-Trojan", Core: "mihomo", Description: "Trojan TLS 出站模板", Default: true},
+	{ID: "mihomo-trojan-grpc", Name: "Mihomo-Trojan-gRPC", Core: "mihomo", Description: "Trojan gRPC 出站模板", Default: false},
+	{ID: "mihomo-shadowsocks", Name: "Mihomo-Shadowsocks", Core: "mihomo", Description: "Shadowsocks 2022 出站模板", Default: true},
+	{ID: "mihomo-hysteria2", Name: "Mihomo-Hysteria2", Core: "mihomo", Description: "Hysteria2 出站模板", Default: false},
+	{ID: "mihomo-tuic", Name: "Mihomo-TUIC", Core: "mihomo", Description: "TUIC 出站模板", Default: false},
+	{ID: "mihomo-wireguard", Name: "Mihomo-WireGuard", Core: "mihomo", Description: "WireGuard 出站模板", Default: false},
+}
+
+func main() {
+	state, err := newAppState()
+	if err != nil {
+		log.Fatalf("init app state failed: %v", err)
+	}
+	if len(os.Args) > 1 && os.Args[1] != "serve" {
+		if err := runCLI(state, os.Stdout, os.Args[1:]); err != nil {
+			log.Fatal(err)
+		}
+		return
+	}
+	if err := runServer(state); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func newAppState() (*AppState, error) {
+	state := &AppState{
+		cfgPath:    resolveConfigPath(),
+		cfg:        defaultConfig(),
+		tokenUntil: make(map[string]time.Time),
+	}
+	if err := state.loadConfig(); err != nil {
+		return nil, err
+	}
+	state.cfg = normalizeRepoDefaults(state.cfg)
+	if result, ctx, err := ensureSubscribeRepoSync(state.cfg); err != nil {
+		log.Printf("subscribe repository check failed: %s status=%s error=%s", result.Status, result.Error, err)
+	} else {
+		log.Printf("subscribe repository status=%s action=%s git_root=%v submodule=%v", result.Status, result.Action, ctx.IsRootRepository, ctx.IsSubmodule)
+	}
+	return state, nil
+}
+
+func runServer(state *AppState) error {
+	cfg := state.snapshotConfig()
+	addr := fmt.Sprintf("%s:%d", cfg.ListenAddr, cfg.ListenPort)
+	log.Printf("vpn233-agent listening on %s", addr)
+	return http.ListenAndServe(addr, buildMux(state))
+}
+
+func buildMux(state *AppState) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", state.dashboardHandler)
+	mux.HandleFunc("/api/v1/health", state.healthHandler)
+	mux.HandleFunc("/api/v1/login", state.loginHandler)
+	mux.HandleFunc("/api/v1/protocols", state.protocolListHandler)
+	mux.HandleFunc("/api/v1/config", state.configHandler)
+	mux.HandleFunc("/api/v1/generate", state.auth(state.generateHandler))
+	mux.HandleFunc("/api/v1/generate.sh", state.auth(state.generateAliasHandler("sh")))
+	mux.HandleFunc("/api/v1/generate.ps1", state.auth(state.generateAliasHandler("ps1")))
+	mux.HandleFunc("/api/v1/repo/status", state.auth(state.repoStatusHandler))
+	mux.HandleFunc("/api/v1/repo/sync", state.auth(state.repoSyncHandler))
+	mux.HandleFunc("/api/v1/subscribe/verify", state.subscribeVerifyHandler)
+
+	mux.HandleFunc("/api/v1/local/health", state.localOnly(state.healthHandler))
+	mux.HandleFunc("/api/v1/local/protocols", state.localOnly(state.protocolListHandler))
+	mux.HandleFunc("/api/v1/local/config", state.localOnly(state.configHandler))
+	mux.HandleFunc("/api/v1/local/generate", state.localOnly(state.generateHandler))
+	mux.HandleFunc("/api/v1/local/generate.sh", state.localOnly(state.generateAliasHandler("sh")))
+	mux.HandleFunc("/api/v1/local/generate.ps1", state.localOnly(state.generateAliasHandler("ps1")))
+	mux.HandleFunc("/api/v1/local/repo/status", state.localOnly(state.repoStatusHandler))
+	mux.HandleFunc("/api/v1/local/repo/sync", state.localOnly(state.repoSyncHandler))
+	return mux
+}
+
+func runCLI(state *AppState, stdout io.Writer, args []string) error {
+	if len(args) == 0 {
+		return runServer(state)
+	}
+	switch args[0] {
+	case "help", "-h", "--help":
+		printCLIUsage(stdout)
+		return nil
+	case "health":
+		return runCLIHealth(state, stdout)
+	case "protocols":
+		return writeCLIJSON(stdout, map[string]any{"items": protocolCatalog})
+	case "config":
+		return runCLIConfig(state, stdout, args[1:])
+	case "config-set":
+		return runCLIConfigSet(state, stdout, args[1:])
+	case "generate":
+		return runCLIGenerate(state, stdout, args[1:])
+	default:
+		return fmt.Errorf("unknown command %q\n\n%s", args[0], cliUsageText())
+	}
+}
+
+func runCLIHealth(state *AppState, stdout io.Writer) error {
+	cfg := state.snapshotConfig()
+	return writeCLIJSON(stdout, map[string]any{
+		"ok":          true,
+		"config_path": state.cfgPath,
+		"listen_addr": cfg.ListenAddr,
+		"listen_port": cfg.ListenPort,
+	})
+}
+
+func runCLIConfig(state *AppState, stdout io.Writer, args []string) error {
+	if len(args) == 0 || args[0] == "get" {
+		return writeCLIJSON(stdout, state.snapshotConfig())
+	}
+	if args[0] == "set" {
+		return runCLIConfigSet(state, stdout, args[1:])
+	}
+	return fmt.Errorf("unknown config subcommand %q", args[0])
+}
+
+func runCLIConfigSet(state *AppState, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("config-set", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	listenAddr := fs.String("listen-addr", "", "listen address")
+	listenPort := fs.Int("listen-port", 0, "listen port")
+	adminUser := fs.String("admin-user", "", "dashboard admin username")
+	adminPassword := fs.String("admin-password", "", "dashboard admin password")
+	defaultDataDir := fs.String("default-data-dir", "", "default data directory")
+	defaultNodeIP := fs.String("default-node-ip", "", "default node IP")
+	defaultPortBase := fs.Int("default-port-base", 0, "default port base")
+	repoURL := fs.String("repo-url", "", "subscribe repo URL")
+	repoPath := fs.String("repo-path", "", "subscribe repo path")
+	repoBranch := fs.String("repo-branch", "", "subscribe repo branch")
+	repoVerifyToken := fs.String("repo-verify-token", "", "subscribe verify token")
+
+	var defaultEnableBBR optionalBool
+	var defaultUseMihomo optionalBool
+	var defaultUseSingbox optionalBool
+	fs.Var(&defaultEnableBBR, "default-enable-bbr", "default BBR toggle")
+	fs.Var(&defaultUseMihomo, "default-use-mihomo", "default Mihomo toggle")
+	fs.Var(&defaultUseSingbox, "default-use-singbox", "default sing-box toggle")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	state.mu.Lock()
+	if *listenAddr != "" {
+		state.cfg.ListenAddr = *listenAddr
+	}
+	if *listenPort > 0 {
+		state.cfg.ListenPort = *listenPort
+	}
+	if *adminUser != "" {
+		state.cfg.AdminUser = *adminUser
+	}
+	if *adminPassword != "" {
+		state.cfg.AdminPassword = *adminPassword
+	}
+	if *defaultDataDir != "" {
+		state.cfg.DefaultDataDir = *defaultDataDir
+	}
+	if *defaultNodeIP != "" {
+		state.cfg.DefaultNodeIP = *defaultNodeIP
+	}
+	if *defaultPortBase > 0 {
+		state.cfg.DefaultPortBase = *defaultPortBase
+	}
+	if *repoURL != "" {
+		state.cfg.SubscribeRepoURL = *repoURL
+	}
+	if *repoPath != "" {
+		state.cfg.SubscribeRepoPath = *repoPath
+	}
+	if *repoBranch != "" {
+		state.cfg.SubscribeRepoBranch = *repoBranch
+	}
+	if *repoVerifyToken != "" {
+		state.cfg.SubscribeVerifyToken = *repoVerifyToken
+	}
+	if defaultEnableBBR.set {
+		state.cfg.DefaultEnableBBR = defaultEnableBBR.value
+	}
+	if defaultUseMihomo.set {
+		state.cfg.DefaultUseMihomo = defaultUseMihomo.value
+	}
+	if defaultUseSingbox.set {
+		state.cfg.DefaultUseSingbox = defaultUseSingbox.value
+	}
+	state.cfg = normalizeRepoDefaults(state.cfg)
+	updated := state.cfg
+	state.mu.Unlock()
+
+	if err := state.saveConfig(); err != nil {
+		return err
+	}
+	return writeCLIJSON(stdout, updated)
+}
+
+func runCLIGenerate(state *AppState, stdout io.Writer, args []string) error {
+	fs := flag.NewFlagSet("generate", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+
+	format := fs.String("format", "json", "output format: json|sh|ps1")
+	nodeName := fs.String("node-name", "", "node display name")
+	nodeIP := fs.String("node-ip", "", "node public IP")
+	adminPassword := fs.String("admin-password", "", "node panel password")
+	uuid := fs.String("uuid", "", "custom UUID")
+	password := fs.String("password", "", "custom password")
+	protocols := fs.String("protocols", "", "comma separated protocol ids")
+	portBase := fs.Int("port-base", 0, "base port")
+
+	var useMihomo optionalBool
+	var useSingbox optionalBool
+	var enableBBR optionalBool
+	fs.Var(&useMihomo, "use-mihomo", "enable Mihomo outputs")
+	fs.Var(&useSingbox, "use-singbox", "enable sing-box outputs")
+	fs.Var(&enableBBR, "enable-bbr", "enable BBR optimization")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	req := InstallRequest{
+		NodeName:      "vpn233-node",
+		AdminPassword: state.snapshotConfig().AdminPassword,
+	}
+	if *nodeName != "" {
+		req.NodeName = *nodeName
+	}
+	if *nodeIP == "" {
+		return fmt.Errorf("--node-ip is required")
+	}
+	req.NodeIP = *nodeIP
+	if *adminPassword != "" {
+		req.AdminPassword = *adminPassword
+	}
+	if *uuid != "" {
+		req.UUID = *uuid
+	}
+	if *password != "" {
+		req.Password = *password
+	}
+	if *protocols != "" {
+		req.SelectedProtocols = splitCSV(*protocols)
+	}
+	if *portBase > 0 {
+		req.PortBase = *portBase
+	}
+	if useMihomo.set {
+		req.UseMihomo = boolPtrValue(useMihomo.value)
+	}
+	if useSingbox.set {
+		req.UseSingbox = boolPtrValue(useSingbox.value)
+	}
+	if enableBBR.set {
+		req.EnableBBR = boolPtrValue(enableBBR.value)
+	}
+
+	result, err := state.generateArtifacts(req)
+	if err != nil {
+		return err
+	}
+
+	switch strings.ToLower(*format) {
+	case "json":
+		return writeCLIJSON(stdout, result)
+	case "sh":
+		_, err = io.WriteString(stdout, result.Shell)
+		return err
+	case "ps1":
+		_, err = io.WriteString(stdout, result.PS1)
+		return err
+	default:
+		return fmt.Errorf("unsupported format %q", *format)
+	}
+}
+
+func writeCLIJSON(stdout io.Writer, value any) error {
+	enc := json.NewEncoder(stdout)
+	enc.SetEscapeHTML(false)
+	enc.SetIndent("", "  ")
+	return enc.Encode(value)
+}
+
+func printCLIUsage(stdout io.Writer) {
+	_, _ = io.WriteString(stdout, cliUsageText())
+}
+
+func cliUsageText() string {
+	return strings.TrimSpace(`
+vpn233-provider-server agent-first commands
+
+Usage:
+  vpn233-provider-server serve
+  vpn233-provider-server health
+  vpn233-provider-server protocols
+  vpn233-provider-server config [get]
+  vpn233-provider-server config set [flags]
+  vpn233-provider-server config-set [flags]
+  vpn233-provider-server generate --node-ip <ip> [flags]
+
+Examples:
+  vpn233-provider-server protocols
+  vpn233-provider-server config set --listen-port 18080 --default-use-singbox=true
+  vpn233-provider-server generate --format sh --node-name edge-01 --node-ip 203.0.113.10
+`) + "\n"
+}
+
+type optionalBool struct {
+	set   bool
+	value bool
+}
+
+func (b *optionalBool) String() string {
+	if !b.set {
+		return ""
+	}
+	return strconv.FormatBool(b.value)
+}
+
+func (b *optionalBool) Set(value string) error {
+	parsed, err := strconv.ParseBool(value)
+	if err != nil {
+		return err
+	}
+	b.value = parsed
+	b.set = true
+	return nil
+}
+
+func (b *optionalBool) IsBoolFlag() bool {
+	return true
+}
+
+func boolPtrValue(value bool) *bool {
+	return &value
+}
+
+func splitCSV(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return nil
+	}
+	items := make([]string, 0)
+	for _, item := range strings.Split(raw, ",") {
+		trimmed := strings.TrimSpace(item)
+		if trimmed != "" {
+			items = append(items, trimmed)
+		}
+	}
+	return items
+}
+
+func (a *AppState) localOnly(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !isLoopbackRemote(r.RemoteAddr) {
+			writeJSON(w, http.StatusForbidden, map[string]any{"error": "local access only"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func isLoopbackRemote(remoteAddr string) bool {
+	host := remoteAddr
+	if parsedHost, _, err := net.SplitHostPort(remoteAddr); err == nil {
+		host = parsedHost
+	}
+	host = strings.TrimSpace(strings.Trim(host, "[]"))
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
+func resolveConfigPath() string {
+	if raw := strings.TrimSpace(os.Getenv("VPN233_CONFIG_PATH")); raw != "" {
+		return raw
+	}
+	exePath, err := os.Executable()
+	if err == nil {
+		candidate := filepath.Join(filepath.Dir(exePath), "agent-config.json")
+		if _, statErr := os.Stat(candidate); statErr == nil {
+			return candidate
+		}
+	}
+	return "agent-config.json"
+}
+
+func defaultConfig() ServerConfig {
+	cfg := ServerConfig{
+		ListenAddr:        "0.0.0.0",
+		ListenPort:        8080,
+		AdminUser:         "root",
+		AdminPassword:     "root",
+		DefaultDataDir:    "/etc/vpn233",
+		DefaultNodeIP:     "",
+		DefaultPortBase:   10000,
+		DefaultEnableBBR:  true,
+		DefaultUseMihomo:  false,
+		DefaultUseSingbox: true,
+	}
+	return normalizeRepoDefaults(cfg)
+}
+
+func (a *AppState) loadConfig() error {
+	b, err := os.ReadFile(a.cfgPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return a.saveConfig()
+		}
+		return err
+	}
+	var next ServerConfig
+	if err := json.Unmarshal(b, &next); err != nil {
+		return err
+	}
+	a.cfg = normalizeRepoDefaults(next)
+	if a.cfg.AdminUser == "" {
+		a.cfg.AdminUser = "root"
+	}
+	if a.cfg.AdminPassword == "" {
+		a.cfg.AdminPassword = "root"
+	}
+	if a.cfg.ListenPort == 0 {
+		a.cfg.ListenPort = 8080
+	}
+	if a.cfg.ListenAddr == "" {
+		a.cfg.ListenAddr = "0.0.0.0"
+	}
+	if a.cfg.DefaultDataDir == "" {
+		a.cfg.DefaultDataDir = "/etc/vpn233"
+	}
+	if a.cfg.DefaultPortBase <= 0 {
+		a.cfg.DefaultPortBase = 10000
+	}
+	return nil
+}
+
+func (a *AppState) saveConfig() error {
+	a.mu.RLock()
+	payload := a.cfg
+	a.mu.RUnlock()
+	raw, _ := json.MarshalIndent(payload, "", "  ")
+	tmp := a.cfgPath + ".tmp"
+	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
+		return err
+	}
+	return os.Rename(tmp, a.cfgPath)
+}
+
+func writeJSON(w http.ResponseWriter, status int, data any) {
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(data)
+}
+
+func writeText(w http.ResponseWriter, status int, data string) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(data))
+}
+
+func (a *AppState) dashboardHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_, _ = w.Write([]byte(dashboardHTML))
+}
+
+func (a *AppState) healthHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "time": time.Now().Format(time.RFC3339)})
+}
+
+func (a *AppState) loginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "only POST"})
+		return
+	}
+	var req AuthRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad request"})
+		return
+	}
+	a.mu.RLock()
+	cfg := a.cfg
+	a.mu.RUnlock()
+	if req.Username != cfg.AdminUser || req.Password != cfg.AdminPassword {
+		writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "bad credentials"})
+		return
+	}
+	token := randomToken(32)
+	a.tokenMu.Lock()
+	a.tokenUntil[token] = time.Now().Add(24 * time.Hour)
+	a.tokenMu.Unlock()
+	writeJSON(w, http.StatusOK, map[string]any{"token": token, "exp": time.Now().Add(24 * time.Hour).Format(time.RFC3339)})
+}
+
+func (a *AppState) auth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("Authorization")
+		token := strings.TrimSpace(strings.TrimPrefix(header, "Bearer "))
+		if token == "" {
+			token = strings.TrimSpace(r.URL.Query().Get("token"))
+		}
+		if token == "" || !a.verifyToken(token) {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "unauthorized"})
+			return
+		}
+		next(w, r)
+	}
+}
+
+func (a *AppState) verifyToken(token string) bool {
+	a.tokenMu.Lock()
+	defer a.tokenMu.Unlock()
+	exp, ok := a.tokenUntil[token]
+	if !ok {
+		return false
+	}
+	if time.Now().After(exp) {
+		delete(a.tokenUntil, token)
+		return false
+	}
+	a.tokenUntil[token] = time.Now().Add(24 * time.Hour)
+	return true
+}
+
+func (a *AppState) snapshotConfig() ServerConfig {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.cfg
+}
+
+func (a *AppState) protocolListHandler(w http.ResponseWriter, r *http.Request) {
+	out := make([]ProtocolCatalog, len(protocolCatalog))
+	copy(out, protocolCatalog)
+	sort.Slice(out, func(i, j int) bool { return out[i].Core < out[j].Core || (out[i].Core == out[j].Core && out[i].ID < out[j].ID) })
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *AppState) configHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodGet:
+		a.mu.RLock()
+		defer a.mu.RUnlock()
+		response := map[string]any{
+			"node_name_default": "vpn233-node",
+			"listen_addr":        a.cfg.ListenAddr,
+			"listen_port":        a.cfg.ListenPort,
+			"admin_user":         a.cfg.AdminUser,
+			"subscribe_repo_url":  a.cfg.SubscribeRepoURL,
+			"subscribe_repo_path": a.cfg.SubscribeRepoPath,
+			"subscribe_repo_branch": a.cfg.SubscribeRepoBranch,
+			"subscribe_verify_token": a.cfg.SubscribeVerifyToken,
+			"default_data_dir":    a.cfg.DefaultDataDir,
+			"default_node_ip":     a.cfg.DefaultNodeIP,
+			"default_port_base":   a.cfg.DefaultPortBase,
+			"default_enable_bbr":  a.cfg.DefaultEnableBBR,
+			"default_use_mihomo":  a.cfg.DefaultUseMihomo,
+			"default_use_singbox": a.cfg.DefaultUseSingbox,
+		}
+		writeJSON(w, http.StatusOK, response)
+	case http.MethodPost:
+		var body ServerConfig
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad request"})
+			return
+		}
+		a.mu.Lock()
+		if body.ListenAddr != "" {
+			a.cfg.ListenAddr = body.ListenAddr
+		}
+		if body.ListenPort > 0 {
+			a.cfg.ListenPort = body.ListenPort
+		}
+		if body.AdminUser != "" {
+			a.cfg.AdminUser = body.AdminUser
+		}
+		if body.AdminPassword != "" {
+			a.cfg.AdminPassword = body.AdminPassword
+		}
+		if body.SubscribeRepoURL != "" {
+			a.cfg.SubscribeRepoURL = body.SubscribeRepoURL
+		}
+		if body.SubscribeRepoPath != "" {
+			a.cfg.SubscribeRepoPath = body.SubscribeRepoPath
+		}
+		if body.SubscribeRepoBranch != "" {
+			a.cfg.SubscribeRepoBranch = body.SubscribeRepoBranch
+		}
+		if body.SubscribeVerifyToken != "" {
+			a.cfg.SubscribeVerifyToken = body.SubscribeVerifyToken
+		}
+		if body.DefaultDataDir != "" {
+			a.cfg.DefaultDataDir = body.DefaultDataDir
+		}
+		if body.DefaultNodeIP != "" {
+			a.cfg.DefaultNodeIP = body.DefaultNodeIP
+		}
+		if body.DefaultPortBase > 0 {
+			a.cfg.DefaultPortBase = body.DefaultPortBase
+		}
+		a.cfg.DefaultEnableBBR = body.DefaultEnableBBR
+		a.cfg.DefaultUseMihomo = body.DefaultUseMihomo
+		a.cfg.DefaultUseSingbox = body.DefaultUseSingbox
+		a.cfg = normalizeRepoDefaults(a.cfg)
+		a.mu.Unlock()
+		if err := a.saveConfig(); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "save failed"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "method not allowed"})
+	}
+}
+
+func (a *AppState) generateHandler(w http.ResponseWriter, r *http.Request) {
+	switch r.Method {
+	case http.MethodPost:
+		var req InstallRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad request body"})
+			return
+		}
+		res, err := a.generateArtifacts(req)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, res)
+	case http.MethodGet:
+		a.generateRawArtifact(w, r, "")
+	default:
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "only GET/POST"})
+	}
+}
+
+func (a *AppState) generateAliasHandler(format string) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "only GET"})
+			return
+		}
+		a.generateRawArtifact(w, r, format)
+	}
+}
+
+func (a *AppState) generateRawArtifact(w http.ResponseWriter, r *http.Request, forcedFormat string) {
+	format := strings.ToLower(strings.TrimSpace(forcedFormat))
+	if format == "" {
+		format = strings.ToLower(strings.TrimSpace(r.URL.Query().Get("format")))
+	}
+	if format != "sh" && format != "ps1" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "format must be sh or ps1"})
+		return
+	}
+	req, err := parseInstallRequestFromQuery(r)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	res, err := a.generateArtifacts(req)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	filename := sanitizeFileName(res.Node.Name)
+	if format == "sh" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-install.sh\"", filename))
+		writeText(w, http.StatusOK, res.Shell)
+		return
+	}
+	w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s-install.ps1\"", filename))
+	writeText(w, http.StatusOK, res.PS1)
+}
+
+func (a *AppState) repoStatusHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "only GET"})
+		return
+	}
+	cfg := a.snapshotConfig()
+	ctx, err := inspectGitContext(".")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{
+			"error": "inspect git context failed",
+			"detail": err.Error(),
+		})
+		return
+	}
+	result, _, syncErr := ensureSubscribeRepoSync(cfg)
+	resp := map[string]any{
+		"repo":            result,
+		"git_context":     ctx,
+		"sync_required":   syncErr != nil && !ctx.IsSubmodule,
+		"verify_endpoint": "/api/v1/subscribe/verify",
+	}
+	if syncErr != nil {
+		resp["error"] = syncErr.Error()
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (a *AppState) repoSyncHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "only POST"})
+		return
+	}
+	cfg := a.snapshotConfig()
+	result, _, err := ensureSubscribeRepoSync(cfg)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"error":      "repo sync failed",
+			"detail":     err.Error(),
+			"repo_state": result,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "repo_state": result})
+}
+
+func (a *AppState) subscribeVerifyHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, map[string]any{"error": "only GET"})
+		return
+	}
+	cfg := a.snapshotConfig()
+	if cfg.SubscribeVerifyToken != "" {
+		got := strings.TrimSpace(r.URL.Query().Get("token"))
+		if got != cfg.SubscribeVerifyToken {
+			writeJSON(w, http.StatusUnauthorized, map[string]any{"error": "subscribe token mismatch"})
+			return
+		}
+	}
+	ctx, err := inspectGitContext(".")
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
+		return
+	}
+	result, _, syncErr := ensureSubscribeRepoSync(cfg)
+	if syncErr != nil && !ctx.IsSubmodule {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":         false,
+			"error":      syncErr.Error(),
+			"repo_state": result,
+			"git_context": ctx,
+		})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":        true,
+		"service":   "vpn233-provider-server",
+		"version":   "1.0.0",
+		"git_root":  ctx.TopLevel,
+		"protocols": protocolCatalog,
+		"repo_state": map[string]any{
+			"path":      result.RepoPath,
+			"url":       result.RepoURL,
+			"branch":    result.Branch,
+			"status":    result.Status,
+		},
+	})
+}
+
+func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error) {
+	a.mu.RLock()
+	cfg := a.cfg
+	a.mu.RUnlock()
+
+	profile, err := normalizeRequest(req, cfg)
+	if err != nil {
+		return generateResult{}, err
+	}
+	selected, err := resolveProtocols(expandSelectedProtocolIDs(profile.SelectedProtocols))
+	if err != nil {
+		return generateResult{}, err
+	}
+
+	mapping := make([]ProtocolPort, 0, len(selected))
+	portByBinding := make(map[string]int)
+	nextPort := profile.PortBase
+	for i, p := range selected {
+		_ = i
+		bindingKey := protocolBindingKey(p.ID)
+		port, ok := portByBinding[bindingKey]
+		if !ok {
+			port = nextPort
+			portByBinding[bindingKey] = port
+			nextPort += 11
+		}
+		mapping = append(mapping, ProtocolPort{
+			ID:      p.ID,
+			Name:    p.Name,
+			Core:    p.Core,
+			Port:    port,
+		})
+	}
+	profile.PortMap = mapping
+
+	singCfg, err := buildSingBoxConfig(profile, mapping)
+	if err != nil {
+		return generateResult{}, err
+	}
+	mihomoCfg, err := buildMihomoTemplate(profile, mapping)
+	if err != nil {
+		return generateResult{}, err
+	}
+
+	shellCtx := map[string]any{
+		"NodeName":       profile.NodeName,
+		"NodeIP":         profile.NodeIP,
+		"ServerName":     profile.ServerName,
+		"RealityServer":  profile.RealityServer,
+		"DataDir":        profile.DataDir,
+		"UseMihomo":      profile.UseMihomo,
+		"UseSingbox":     profile.UseSingbox,
+		"EnableBBR":      profile.EnableBBR,
+		"PortBase":       profile.PortBase,
+		"UUID":           profile.UUID,
+		"Password":       profile.Password,
+		"GRPCServiceName": profile.GRPCServiceName,
+		"RealityPublicKey": profile.RealityPublicKey,
+		"RealityShortID": profile.RealityShortID,
+		"WireGuardClientPrivateKey": profile.WireGuardClientPrivateKey,
+		"WireGuardServerPublicKey": profile.WireGuardServerPublicKey,
+		"WireGuardPresharedKey": profile.WireGuardPresharedKey,
+		"WireGuardClientCIDR": profile.WireGuardClientCIDR,
+		"Ports":          mapping,
+		"PortsCSV":       buildPortsCSV(mapping),
+		"PortsJSON":      buildPortsJSON(mapping),
+		"SingBoxConfig":  singCfg,
+		"MihomoConfig":   mihomoCfg,
+		"TLSCertPEM":     profile.TLSCertPEM,
+		"TLSKeyPEM":      profile.TLSKeyPEM,
+		"GeneratedAt":    time.Now().Format(time.RFC3339),
+	}
+
+	sh, err := renderTemplate(shellInstallTemplate, shellCtx)
+	if err != nil {
+		return generateResult{}, err
+	}
+	ps1, err := renderTemplate(ps1InstallTemplate, map[string]any{
+		"NodeName":       profile.NodeName,
+		"NodeIP":         profile.NodeIP,
+		"ServerName":     profile.ServerName,
+		"RealityServer":  profile.RealityServer,
+		"DataDir":        profile.DataDir,
+		"UseMihomo":      profile.UseMihomo,
+		"UseSingbox":     profile.UseSingbox,
+		"EnableBBR":      profile.EnableBBR,
+		"GRPCServiceName": profile.GRPCServiceName,
+		"RealityPublicKey": profile.RealityPublicKey,
+		"RealityShortID": profile.RealityShortID,
+		"WireGuardClientPrivateKey": profile.WireGuardClientPrivateKey,
+		"WireGuardServerPublicKey": profile.WireGuardServerPublicKey,
+		"WireGuardPresharedKey": profile.WireGuardPresharedKey,
+		"WireGuardClientCIDR": profile.WireGuardClientCIDR,
+		"PortsCSV":       buildPortsCSV(mapping),
+		"PortsJSON":      buildPortsJSON(mapping),
+		"Password":       profile.Password,
+		"SingBoxConfig":  singCfg,
+		"MihomoConfig":   mihomoCfg,
+		"TLSCertPEM":     profile.TLSCertPEM,
+		"TLSKeyPEM":      profile.TLSKeyPEM,
+		"GeneratedAt":    time.Now().Format(time.RFC3339),
+	})
+	if err != nil {
+		return generateResult{}, err
+	}
+
+	var result generateResult
+	result.Shell = sh
+	result.PS1 = ps1
+	result.Node.Name = profile.NodeName
+	result.Node.NodeIP = profile.NodeIP
+	result.Node.ServerName = profile.ServerName
+	result.Node.UUID = profile.UUID
+	result.Node.Password = profile.Password
+	result.Node.GRPCServiceName = profile.GRPCServiceName
+	result.Node.RealityPublicKey = profile.RealityPublicKey
+	result.Node.RealityShortID = profile.RealityShortID
+	result.Node.WireGuardClientKey = profile.WireGuardClientPrivateKey
+	result.Node.WireGuardPresharedKey = profile.WireGuardPresharedKey
+	result.Node.WireGuardClientCIDR = profile.WireGuardClientCIDR
+	result.Node.MihomoDir = filepath.Join(profile.DataDir, "mihomo")
+	result.Node.SingBoxDir = filepath.Join(profile.DataDir, "singbox")
+	result.Node.Ports = mapping
+	result.Node.Links = buildConnectionLinks(profile, mapping)
+	return result, nil
+}
+
+type normalizedRequest struct {
+	NodeName          string
+	NodeIP            string
+	ServerName        string
+	DataDir           string
+	UseMihomo         bool
+	UseSingbox        bool
+	EnableBBR         bool
+	PortBase          int
+	AdminPassword     string
+	UUID              string
+	Password          string
+	GRPCServiceName   string
+	RealityPrivateKey string
+	RealityPublicKey  string
+	RealityShortID    string
+	RealityServer     string
+	TLSCertPEM        string
+	TLSKeyPEM         string
+	WireGuardServerPrivateKey string
+	WireGuardServerPublicKey  string
+	WireGuardClientPrivateKey string
+	WireGuardClientPublicKey  string
+	WireGuardPresharedKey     string
+	WireGuardServerCIDR       string
+	WireGuardClientCIDR       string
+	SelectedProtocols []string
+	PortMap           []ProtocolPort
+}
+
+func normalizeRequest(req InstallRequest, cfg ServerConfig) (normalizedRequest, error) {
+	out := normalizedRequest{
+		NodeName:   "vpn233-node",
+		NodeIP:     cfg.DefaultNodeIP,
+		DataDir:    strings.TrimSpace(cfg.DefaultDataDir),
+		PortBase:   cfg.DefaultPortBase,
+		EnableBBR:  cfg.DefaultEnableBBR,
+		UseMihomo:  cfg.DefaultUseMihomo,
+		UseSingbox: cfg.DefaultUseSingbox,
+		GRPCServiceName: "vpn233-grpc",
+		RealityServer:   "www.cloudflare.com",
+		WireGuardServerCIDR: "172.19.0.1/30",
+		WireGuardClientCIDR: "172.19.0.2/32",
+	}
+	if req.NodeName != "" {
+		out.NodeName = req.NodeName
+	}
+	if req.NodeIP != "" && req.NodeIP != "auto" {
+		out.NodeIP = req.NodeIP
+	}
+	if strings.TrimSpace(out.NodeIP) == "" || strings.EqualFold(strings.TrimSpace(out.NodeIP), "auto") {
+		out.NodeIP = "127.0.0.1"
+	}
+	if req.PortBase > 0 {
+		out.PortBase = req.PortBase
+	}
+	if req.UseMihomo != nil {
+		out.UseMihomo = *req.UseMihomo
+	}
+	if req.UseSingbox != nil {
+		out.UseSingbox = *req.UseSingbox
+	}
+	if req.EnableBBR != nil {
+		out.EnableBBR = *req.EnableBBR
+	}
+	out.AdminPassword = req.AdminPassword
+	if req.AdminPassword != "" {
+		out.Password = req.AdminPassword
+	} else {
+		out.Password = randomToken(16)
+	}
+	out.UUID = strings.TrimSpace(req.UUID)
+	if out.UUID == "" {
+		out.UUID = randomUUID()
+	}
+	if len(req.SelectedProtocols) > 0 {
+		out.SelectedProtocols = req.SelectedProtocols
+	} else {
+		out.SelectedProtocols = defaultProtocolIDs()
+	}
+	out.ServerName = normalizeServerName(out.NodeIP)
+	realityPrivate, realityPublic, err := generateRealityKeyPair()
+	if err != nil {
+		return normalizedRequest{}, err
+	}
+	out.RealityPrivateKey = realityPrivate
+	out.RealityPublicKey = realityPublic
+	out.RealityShortID = randomHex(8)
+	tlsCert, tlsKey, err := generateSelfSignedCertificate(out.ServerName)
+	if err != nil {
+		return normalizedRequest{}, err
+	}
+	out.TLSCertPEM = tlsCert
+	out.TLSKeyPEM = tlsKey
+	wgServerPrivate, wgServerPublic, wgClientPrivate, wgClientPublic, wgPSK, err := generateWireGuardKeys()
+	if err != nil {
+		return normalizedRequest{}, err
+	}
+	out.WireGuardServerPrivateKey = wgServerPrivate
+	out.WireGuardServerPublicKey = wgServerPublic
+	out.WireGuardClientPrivateKey = wgClientPrivate
+	out.WireGuardClientPublicKey = wgClientPublic
+	out.WireGuardPresharedKey = wgPSK
+	return out, nil
+}
+
+func defaultProtocolIDs() []string {
+	out := make([]string, 0, len(protocolCatalog))
+	for _, p := range protocolCatalog {
+		if p.Default {
+			out = append(out, p.ID)
+		}
+	}
+	if len(out) == 0 {
+		out = append(out,
+			"singbox-vless",
+			"singbox-vless-grpc",
+			"singbox-vless-reality-grpc",
+			"singbox-trojan",
+			"singbox-shadowsocks",
+		)
+	}
+	return out
+}
+
+func resolveProtocols(selected []string) ([]ProtocolCatalog, error) {
+	want := make(map[string]struct{}, len(selected))
+	for _, id := range selected {
+		want[id] = struct{}{}
+	}
+	out := make([]ProtocolCatalog, 0, len(want))
+	for _, p := range protocolCatalog {
+		if _, ok := want[p.ID]; ok {
+			out = append(out, p)
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("no valid protocol selected")
+	}
+	allowed := make(map[string]struct{}, len(out))
+	for _, p := range out {
+		allowed[p.ID] = struct{}{}
+	}
+	for id := range want {
+		if _, ok := allowed[id]; !ok {
+			return nil, fmt.Errorf("unsupported protocol: %s", id)
+		}
+	}
+	return out, nil
+}
+
+func expandSelectedProtocolIDs(selected []string) []string {
+	if len(selected) == 0 {
+		return selected
+	}
+	expanded := make([]string, 0, len(selected)*2)
+	seen := make(map[string]struct{}, len(selected)*2)
+	for _, id := range selected {
+		if _, ok := seen[id]; !ok {
+			expanded = append(expanded, id)
+			seen[id] = struct{}{}
+		}
+		if pair, ok := mihomoToSingboxPair(id); ok {
+			if _, exists := seen[pair]; !exists {
+				expanded = append(expanded, pair)
+				seen[pair] = struct{}{}
+			}
+		}
+	}
+	return expanded
+}
+
+func mihomoToSingboxPair(id string) (string, bool) {
+	switch id {
+	case "mihomo-vless":
+		return "singbox-vless", true
+	case "mihomo-vless-grpc":
+		return "singbox-vless-grpc", true
+	case "mihomo-vless-reality-grpc":
+		return "singbox-vless-reality-grpc", true
+	case "mihomo-vmess":
+		return "singbox-vmess", true
+	case "mihomo-vmess-ws":
+		return "singbox-vmess-ws", true
+	case "mihomo-trojan":
+		return "singbox-trojan", true
+	case "mihomo-trojan-grpc":
+		return "singbox-trojan-grpc", true
+	case "mihomo-shadowsocks":
+		return "singbox-shadowsocks", true
+	case "mihomo-hysteria2":
+		return "singbox-hysteria2", true
+	case "mihomo-tuic":
+		return "singbox-tuic", true
+	case "mihomo-wireguard":
+		return "singbox-wireguard", true
+	default:
+		return "", false
+	}
+}
+
+func protocolBindingKey(id string) string {
+	id = strings.TrimPrefix(id, "singbox-")
+	id = strings.TrimPrefix(id, "mihomo-")
+	return id
+}
+
+func buildPortsCSV(ports []ProtocolPort) string {
+	parts := make([]string, len(ports))
+	for i, p := range ports {
+		parts[i] = fmt.Sprintf("%d", p.Port)
+	}
+	return strings.Join(parts, ",")
+}
+
+func buildPortsJSON(ports []ProtocolPort) string {
+	raw, err := json.Marshal(ports)
+	if err != nil {
+		return "[]"
+	}
+	return string(raw)
+}
+
+func buildConnectionLinks(req normalizedRequest, ports []ProtocolPort) []string {
+	out := make([]string, 0, len(ports))
+	for _, p := range ports {
+		if p.Core != "singbox" {
+			continue
+		}
+		link := connectionLinkForProtocol(req, p)
+		if link != "" {
+			out = append(out, link)
+		}
+	}
+	return out
+}
+
+func connectionLinkForProtocol(req normalizedRequest, p ProtocolPort) string {
+	switch p.ID {
+	case "singbox-vless":
+		return fmt.Sprintf("vless://%s@%s:%d?security=none&type=tcp#%s", req.UUID, req.NodeIP, p.Port, p.Name)
+	case "singbox-vless-grpc":
+		return fmt.Sprintf("vless://%s@%s:%d?security=tls&sni=%s&type=grpc&serviceName=%s#%s", req.UUID, req.NodeIP, p.Port, req.ServerName, req.GRPCServiceName, p.Name)
+	case "singbox-vless-reality":
+		return fmt.Sprintf("vless://%s@%s:%d?security=reality&sni=%s&pbk=%s&sid=%s&type=tcp#%s", req.UUID, req.NodeIP, p.Port, req.RealityServer, req.RealityPublicKey, req.RealityShortID, p.Name)
+	case "singbox-vless-reality-grpc":
+		return fmt.Sprintf("vless://%s@%s:%d?security=reality&sni=%s&pbk=%s&sid=%s&type=grpc&serviceName=%s#%s", req.UUID, req.NodeIP, p.Port, req.RealityServer, req.RealityPublicKey, req.RealityShortID, req.GRPCServiceName, p.Name)
+	case "singbox-vmess":
+		return vmessLink(req.NodeIP, p.Port, req.UUID, "", "", false)
+	case "singbox-vmess-ws":
+		return vmessLink(req.NodeIP, p.Port, req.UUID, "/vpn233-vmess", req.ServerName, true)
+	case "singbox-trojan":
+		return fmt.Sprintf("trojan://%s@%s:%d?sni=%s#%s", req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
+	case "singbox-trojan-grpc":
+		return fmt.Sprintf("trojan://%s@%s:%d?sni=%s&type=grpc&serviceName=%s#%s", req.Password, req.NodeIP, p.Port, req.ServerName, req.GRPCServiceName, p.Name)
+	case "singbox-shadowsocks":
+		userInfo := base64.StdEncoding.EncodeToString([]byte("2022-blake3-chacha20-poly1305:" + req.Password))
+		return fmt.Sprintf("ss://%s@%s:%d#%s", userInfo, req.NodeIP, p.Port, p.Name)
+	case "singbox-hysteria2":
+		return fmt.Sprintf("hysteria2://%s@%s:%d?sni=%s&insecure=1#%s", req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
+	case "singbox-tuic":
+		return fmt.Sprintf("tuic://%s:%s@%s:%d?sni=%s&congestion_control=bbr#%s", req.UUID, req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
+	case "singbox-wireguard":
+		return fmt.Sprintf("wireguard://%s@%s:%d?publickey=%s&presharedkey=%s&address=%s#%s", req.WireGuardClientPrivateKey, req.NodeIP, p.Port, req.WireGuardServerPublicKey, req.WireGuardPresharedKey, req.WireGuardClientCIDR, p.Name)
+	case "singbox-socks":
+		return fmt.Sprintf("socks5://vpn233:%s@%s:%d#%s", req.Password, req.NodeIP, p.Port, p.Name)
+	case "singbox-http":
+		return fmt.Sprintf("http://vpn233:%s@%s:%d#%s", req.Password, req.NodeIP, p.Port, p.Name)
+	default:
+		return ""
+	}
+}
+
+func vmessLink(host string, port int, uuid, pathValue, serverName string, tlsEnabled bool) string {
+	payload := map[string]string{
+		"v":   "2",
+		"ps":  "VMess",
+		"add": host,
+		"port": strconv.Itoa(port),
+		"id":  uuid,
+		"aid": "0",
+		"scy": "auto",
+		"net": "tcp",
+		"type": "none",
+		"host": "",
+		"path": "",
+		"tls": "",
+		"sni": "",
+	}
+	if pathValue != "" {
+		payload["net"] = "ws"
+		payload["path"] = pathValue
+		payload["host"] = serverName
+	}
+	if tlsEnabled {
+		payload["tls"] = "tls"
+		payload["sni"] = serverName
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return ""
+	}
+	return "vmess://" + base64.StdEncoding.EncodeToString(raw)
+}
+
+func buildSingBoxConfig(req normalizedRequest, ports []ProtocolPort) (string, error) {
+	cfg := map[string]any{
+		"log": map[string]any{
+			"level": "info",
+			"timestamp": true,
+		},
+		"dns": map[string]any{
+			"strategy": "prefer_ipv4",
+			"servers": []any{
+				map[string]any{"tag": "cloudflare", "address": "https://1.1.1.1/dns-query", "detour": "direct"},
+				map[string]any{"tag": "alidns", "address": "223.5.5.5", "detour": "direct"},
+			},
+			"final": "cloudflare",
+		},
+		"inbounds": []any{},
+		"outbounds": []any{
+			map[string]any{
+				"type": "dns",
+				"tag":  "dns-out",
+			},
+			map[string]any{
+				"type": "direct",
+				"tag":  "direct",
+			},
+			map[string]any{
+				"type": "block",
+				"tag":  "block",
+			},
+		},
+		"route": map[string]any{
+			"auto_detect_interface": true,
+			"final": "direct",
+			"rules": []any{
+				map[string]any{"protocol": "dns", "outbound": "dns-out"},
+				map[string]any{"network": "udp", "port": 53, "outbound": "dns-out"},
+			},
+		},
+	}
+	inbounds := make([]any, 0)
+	for _, p := range ports {
+		if p.Core != "singbox" {
+			continue
+		}
+		b, err := singBoxInbound(req, p)
+		if err != nil {
+			return "", err
+		}
+		inbounds = append(inbounds, b)
+	}
+	if len(inbounds) == 0 {
+		inbounds = append(inbounds, singBoxInboundVLESS(18000, req.UUID))
+	}
+	cfg["inbounds"] = inbounds
+	raw, err := json.MarshalIndent(cfg, "", "  ")
+	if err != nil {
+		return "", err
+	}
+	return string(raw), nil
+}
+
+func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, error) {
+	switch p.ID {
+	case "singbox-vless":
+		return singBoxInboundVLESS(p.Port, req.UUID), nil
+	case "singbox-vless-grpc":
+		inbound := singBoxInboundVLESS(p.Port, req.UUID)
+		inbound["tag"] = "vless-grpc-" + fmt.Sprintf("%d", p.Port)
+		inbound["tls"] = singBoxTLSConfig(req, []string{"h2", "http/1.1"})
+		inbound["transport"] = grpcTransport(req)
+		return inbound, nil
+	case "singbox-vless-reality":
+		inbound := singBoxInboundVLESS(p.Port, req.UUID)
+		inbound["tag"] = "vless-reality-" + fmt.Sprintf("%d", p.Port)
+		inbound["tls"] = singBoxRealityConfig(req, []string{"h2", "http/1.1"})
+		return inbound, nil
+	case "singbox-vless-reality-grpc":
+		inbound := singBoxInboundVLESS(p.Port, req.UUID)
+		inbound["tag"] = "vless-reality-grpc-" + fmt.Sprintf("%d", p.Port)
+		inbound["tls"] = singBoxRealityConfig(req, []string{"h2", "http/1.1"})
+		inbound["transport"] = grpcTransport(req)
+		return inbound, nil
+	case "singbox-vmess":
+		return map[string]any{
+			"type":        "vmess",
+			"tag":         "vmess-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{
+					"uuid": req.UUID,
+					"alterId": 0,
+				},
+			},
+			"proxy_protocol": false,
+		}, nil
+	case "singbox-vmess-ws":
+		return map[string]any{
+			"type":        "vmess",
+			"tag":         "vmess-ws-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{
+					"uuid": req.UUID,
+					"alterId": 0,
+				},
+			},
+			"tls":       singBoxTLSConfig(req, []string{"http/1.1"}),
+			"transport": wsTransport("/vpn233-vmess", req.ServerName),
+		}, nil
+	case "singbox-trojan":
+		return map[string]any{
+			"type":        "trojan",
+			"tag":         "trojan-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{
+					"name": "admin",
+					"password": req.Password,
+				},
+			},
+			"tls": singBoxTLSConfig(req, []string{"h2", "http/1.1"}),
+		}, nil
+	case "singbox-trojan-grpc":
+		return map[string]any{
+			"type":        "trojan",
+			"tag":         "trojan-grpc-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{
+					"name": "admin",
+					"password": req.Password,
+				},
+			},
+			"tls":       singBoxTLSConfig(req, []string{"h2", "http/1.1"}),
+			"transport": grpcTransport(req),
+		}, nil
+	case "singbox-shadowsocks":
+		return map[string]any{
+			"type":        "shadowsocks",
+			"tag":         "ss-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"method":      "2022-blake3-chacha20-poly1305",
+			"password":    req.Password,
+		}, nil
+	case "singbox-hysteria2":
+		return map[string]any{
+			"type":        "hysteria2",
+			"tag":         "hysteria2-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"up_mbps":     100,
+			"down_mbps":   1000,
+			"users": []any{
+				map[string]any{"password": req.Password},
+			},
+			"tls": singBoxTLSConfig(req, []string{"h3"}),
+		}, nil
+	case "singbox-tuic":
+		return map[string]any{
+			"type":        "tuic",
+			"tag":         "tuic-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{
+					"uuid":     req.UUID,
+					"password": req.Password,
+				},
+			},
+			"congestion_control": "bbr",
+			"zero_rtt_handshake": false,
+			"tls": singBoxTLSConfig(req, []string{"h3"}),
+		}, nil
+	case "singbox-wireguard":
+		return map[string]any{
+			"type":         "wireguard",
+			"tag":          "wg-" + fmt.Sprintf("%d", p.Port),
+			"listen_port":  p.Port,
+			"address":      []string{req.WireGuardServerCIDR},
+			"private_key":  req.WireGuardServerPrivateKey,
+			"mtu":          1408,
+			"peers": []any{
+				map[string]any{
+					"public_key":     req.WireGuardClientPublicKey,
+					"pre_shared_key": req.WireGuardPresharedKey,
+					"allowed_ips":    []string{req.WireGuardClientCIDR},
+				},
+			},
+		}, nil
+	case "singbox-socks":
+		return map[string]any{
+			"type":        "socks",
+			"tag":         "socks-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{"username": "vpn233", "password": req.Password},
+			},
+			"udp":         true,
+		}, nil
+	case "singbox-http":
+		return map[string]any{
+			"type":        "http",
+			"tag":         "http-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{"username": "vpn233", "password": req.Password},
+			},
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported singbox protocol: %s", p.ID)
+	}
+}
+
+func singBoxInboundVLESS(port int, uuid string) map[string]any {
+	return map[string]any{
+		"type":        "vless",
+		"tag":         "vless-" + fmt.Sprintf("%d", port),
+		"listen":      "::",
+		"listen_port": port,
+		"users": []any{
+			map[string]any{
+				"uuid": uuid,
+				"flow": "xtls-rprx-vision",
+			},
+		},
+		"tls": map[string]any{
+			"enabled": false,
+		},
+	}
+}
+
+func singBoxTLSConfig(req normalizedRequest, alpn []string) map[string]any {
+	cfg := map[string]any{
+		"enabled":          true,
+		"server_name":      req.ServerName,
+		"certificate_path": toSlashPath(req.DataDir, "tls", "server.crt"),
+		"key_path":         toSlashPath(req.DataDir, "tls", "server.key"),
+	}
+	if len(alpn) > 0 {
+		cfg["alpn"] = alpn
+	}
+	return cfg
+}
+
+func singBoxRealityConfig(req normalizedRequest, alpn []string) map[string]any {
+	cfg := map[string]any{
+		"enabled":     true,
+		"server_name": req.RealityServer,
+		"reality": map[string]any{
+			"enabled":             true,
+			"private_key":         req.RealityPrivateKey,
+			"short_id":            []string{req.RealityShortID},
+			"max_time_difference": "10s",
+			"handshake": map[string]any{
+				"server":      req.RealityServer,
+				"server_port": 443,
+			},
+		},
+	}
+	if len(alpn) > 0 {
+		cfg["alpn"] = alpn
+	}
+	return cfg
+}
+
+func grpcTransport(req normalizedRequest) map[string]any {
+	return map[string]any{
+		"type":               "grpc",
+		"service_name":       req.GRPCServiceName,
+		"idle_timeout":       "15s",
+		"permit_without_stream": false,
+	}
+}
+
+func wsTransport(pathValue, host string) map[string]any {
+	return map[string]any{
+		"type": "ws",
+		"path": pathValue,
+		"headers": map[string]any{
+			"Host": host,
+		},
+	}
+}
+
+func buildMihomoTemplate(req normalizedRequest, ports []ProtocolPort) (string, error) {
+	var b strings.Builder
+	proxyNames := make([]string, 0)
+	proxyBlocks := make([][]string, 0)
+	for _, p := range ports {
+		if p.Core != "mihomo" {
+			continue
+		}
+		name := mihomoProxyName(p)
+		lines, err := mihomoProxyLines(req, p, name)
+		if err != nil {
+			return "", err
+		}
+		proxyNames = append(proxyNames, name)
+		proxyBlocks = append(proxyBlocks, lines)
+	}
+
+	_, _ = fmt.Fprintf(&b, "# generated: %s\n", req.NodeName)
+	_, _ = fmt.Fprintln(&b, "# generated by vpn233-agent")
+	_, _ = fmt.Fprintln(&b, "mixed-port: 7890")
+	_, _ = fmt.Fprintln(&b, "allow-lan: true")
+	_, _ = fmt.Fprintln(&b, "bind-address: 0.0.0.0")
+	_, _ = fmt.Fprintln(&b, "ipv6: true")
+	_, _ = fmt.Fprintln(&b, "mode: rule")
+	_, _ = fmt.Fprintln(&b, "log-level: info")
+	_, _ = fmt.Fprintln(&b, "external-controller: 127.0.0.1:9090")
+	_, _ = fmt.Fprintln(&b, "find-process-mode: strict")
+	_, _ = fmt.Fprintln(&b, "tcp-concurrent: true")
+	_, _ = fmt.Fprintln(&b, "dns:")
+	_, _ = fmt.Fprintln(&b, "  enable: true")
+	_, _ = fmt.Fprintln(&b, "  ipv6: true")
+	_, _ = fmt.Fprintln(&b, "  enhanced-mode: fake-ip")
+	_, _ = fmt.Fprintln(&b, "  fake-ip-range: 198.18.0.1/16")
+	_, _ = fmt.Fprintln(&b, "  nameserver:")
+	_, _ = fmt.Fprintln(&b, "    - https://dns.alidns.com/dns-query")
+	_, _ = fmt.Fprintln(&b, "    - https://cloudflare-dns.com/dns-query")
+	_, _ = fmt.Fprintln(&b, "listeners:")
+	_, _ = fmt.Fprintln(&b, "  - name: mixed-in")
+	_, _ = fmt.Fprintln(&b, "    type: mixed")
+	_, _ = fmt.Fprintln(&b, "    port: 7890")
+	_, _ = fmt.Fprintln(&b, "    listen: 0.0.0.0")
+	_, _ = fmt.Fprintln(&b, "proxies:")
+	if len(proxyBlocks) == 0 {
+		_, _ = fmt.Fprintln(&b, "  []")
+	} else {
+		for _, block := range proxyBlocks {
+			for _, line := range block {
+				_, _ = fmt.Fprintln(&b, line)
+			}
+		}
+	}
+	_, _ = fmt.Fprintln(&b, "proxy-groups:")
+	_, _ = fmt.Fprintln(&b, "  - name: PROXY")
+	_, _ = fmt.Fprintln(&b, "    type: select")
+	_, _ = fmt.Fprintln(&b, "    proxies:")
+	if len(proxyNames) == 0 {
+		_, _ = fmt.Fprintln(&b, "      - DIRECT")
+	} else {
+		_, _ = fmt.Fprintln(&b, "      - AUTO")
+		_, _ = fmt.Fprintln(&b, "      - DIRECT")
+		for _, name := range proxyNames {
+			_, _ = fmt.Fprintf(&b, "      - %s\n", name)
+		}
+		_, _ = fmt.Fprintln(&b, "  - name: AUTO")
+		_, _ = fmt.Fprintln(&b, "    type: url-test")
+		_, _ = fmt.Fprintln(&b, "    url: http://www.gstatic.com/generate_204")
+		_, _ = fmt.Fprintln(&b, "    interval: 300")
+		_, _ = fmt.Fprintln(&b, "    tolerance: 50")
+		_, _ = fmt.Fprintln(&b, "    proxies:")
+		for _, name := range proxyNames {
+			_, _ = fmt.Fprintf(&b, "      - %s\n", name)
+		}
+	}
+	_, _ = fmt.Fprintln(&b, "rules:")
+	_, _ = fmt.Fprintln(&b, "  - DOMAIN-SUFFIX,local,DIRECT")
+	_, _ = fmt.Fprintln(&b, "  - DOMAIN-KEYWORD,tracker,REJECT")
+	_, _ = fmt.Fprintln(&b, "  - GEOIP,LAN,DIRECT,no-resolve")
+	_, _ = fmt.Fprintln(&b, "  - GEOIP,CN,DIRECT,no-resolve")
+	_, _ = fmt.Fprintln(&b, "  - MATCH,PROXY")
+	return b.String(), nil
+}
+
+func mihomoProxyName(p ProtocolPort) string {
+	base := strings.TrimPrefix(p.ID, "mihomo-")
+	base = strings.ReplaceAll(base, "_", "-")
+	return fmt.Sprintf("%s-%d", base, p.Port)
+}
+
+func mihomoProxyLines(req normalizedRequest, p ProtocolPort, name string) ([]string, error) {
+	server := yamlQuote(req.NodeIP)
+	switch p.ID {
+	case "mihomo-vless":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: vless",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
+			"    udp: true",
+			"    tls: false",
+		}, nil
+	case "mihomo-vless-grpc":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: vless",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
+			"    udp: true",
+			"    tls: true",
+			fmt.Sprintf("    servername: %s", yamlQuote(req.ServerName)),
+			"    skip-cert-verify: true",
+			"    network: grpc",
+			"    grpc-opts:",
+			fmt.Sprintf("      grpc-service-name: %s", yamlQuote(req.GRPCServiceName)),
+		}, nil
+	case "mihomo-vless-reality-grpc":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: vless",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
+			"    udp: true",
+			"    tls: true",
+			fmt.Sprintf("    servername: %s", yamlQuote(req.RealityServer)),
+			"    client-fingerprint: chrome",
+			"    network: grpc",
+			"    grpc-opts:",
+			fmt.Sprintf("      grpc-service-name: %s", yamlQuote(req.GRPCServiceName)),
+			"    reality-opts:",
+			fmt.Sprintf("      public-key: %s", yamlQuote(req.RealityPublicKey)),
+			fmt.Sprintf("      short-id: %s", yamlQuote(req.RealityShortID)),
+		}, nil
+	case "mihomo-vmess":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: vmess",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
+			"    alterId: 0",
+			"    cipher: auto",
+			"    udp: true",
+			"    tls: false",
+		}, nil
+	case "mihomo-vmess-ws":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: vmess",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
+			"    alterId: 0",
+			"    cipher: auto",
+			"    udp: true",
+			"    tls: true",
+			fmt.Sprintf("    servername: %s", yamlQuote(req.ServerName)),
+			"    skip-cert-verify: true",
+			"    network: ws",
+			"    ws-opts:",
+			"      path: /vpn233-vmess",
+			"      headers:",
+			fmt.Sprintf("        Host: %s", yamlQuote(req.ServerName)),
+		}, nil
+	case "mihomo-trojan":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: trojan",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
+			"    udp: true",
+			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
+			"    skip-cert-verify: true",
+		}, nil
+	case "mihomo-trojan-grpc":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: trojan",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
+			"    udp: true",
+			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
+			"    skip-cert-verify: true",
+			"    network: grpc",
+			"    grpc-opts:",
+			fmt.Sprintf("      grpc-service-name: %s", yamlQuote(req.GRPCServiceName)),
+		}, nil
+	case "mihomo-shadowsocks":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: ss",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			"    cipher: 2022-blake3-chacha20-poly1305",
+			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
+			"    udp: true",
+		}, nil
+	case "mihomo-hysteria2":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: hysteria2",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
+			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
+			"    skip-cert-verify: true",
+			"    udp: true",
+		}, nil
+	case "mihomo-tuic":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: tuic",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    uuid: %s", yamlQuote(req.UUID)),
+			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
+			"    udp: true",
+			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
+			"    skip-cert-verify: true",
+			"    congestion-controller: bbr",
+		}, nil
+	case "mihomo-wireguard":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: wireguard",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    ip: %s", yamlQuote(req.WireGuardClientCIDR)),
+			fmt.Sprintf("    private-key: %s", yamlQuote(req.WireGuardClientPrivateKey)),
+			fmt.Sprintf("    public-key: %s", yamlQuote(req.WireGuardServerPublicKey)),
+			fmt.Sprintf("    pre-shared-key: %s", yamlQuote(req.WireGuardPresharedKey)),
+			"    udp: true",
+			"    mtu: 1408",
+		}, nil
+	default:
+		return nil, fmt.Errorf("unsupported mihomo protocol: %s", p.ID)
+	}
+}
+
+func parseInstallRequestFromQuery(r *http.Request) (InstallRequest, error) {
+	q := r.URL.Query()
+	req := InstallRequest{
+		NodeName:      strings.TrimSpace(q.Get("node_name")),
+		NodeIP:        strings.TrimSpace(q.Get("node_ip")),
+		AdminPassword: strings.TrimSpace(q.Get("admin_password")),
+		UUID:          strings.TrimSpace(q.Get("uuid")),
+		Password:      strings.TrimSpace(q.Get("password")),
+	}
+	if raw := strings.TrimSpace(q.Get("port_base")); raw != "" {
+		portBase, err := strconv.Atoi(raw)
+		if err != nil {
+			return InstallRequest{}, fmt.Errorf("bad port_base")
+		}
+		req.PortBase = portBase
+	}
+	if v, ok, err := parseOptionalBoolQuery(q.Get("use_mihomo")); err != nil {
+		return InstallRequest{}, fmt.Errorf("bad use_mihomo")
+	} else if ok {
+		req.UseMihomo = &v
+	}
+	if v, ok, err := parseOptionalBoolQuery(q.Get("use_singbox")); err != nil {
+		return InstallRequest{}, fmt.Errorf("bad use_singbox")
+	} else if ok {
+		req.UseSingbox = &v
+	}
+	if v, ok, err := parseOptionalBoolQuery(q.Get("enable_bbr")); err != nil {
+		return InstallRequest{}, fmt.Errorf("bad enable_bbr")
+	} else if ok {
+		req.EnableBBR = &v
+	}
+	rawProtocols := strings.TrimSpace(q.Get("selected_protocols"))
+	if rawProtocols == "" {
+		rawProtocols = strings.TrimSpace(q.Get("protocols"))
+	}
+	if rawProtocols != "" {
+		for _, item := range strings.Split(rawProtocols, ",") {
+			item = strings.TrimSpace(item)
+			if item != "" {
+				req.SelectedProtocols = append(req.SelectedProtocols, item)
+			}
+		}
+	}
+	return req, nil
+}
+
+func parseOptionalBoolQuery(raw string) (bool, bool, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return false, false, nil
+	}
+	v, err := strconv.ParseBool(raw)
+	if err != nil {
+		return false, false, err
+	}
+	return v, true, nil
+}
+
+func sanitizeFileName(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return "vpn233-node"
+	}
+	var b strings.Builder
+	for _, r := range raw {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteRune('-')
+	}
+	return strings.Trim(b.String(), "-")
+}
+
+func normalizeServerName(host string) string {
+	host = strings.TrimSpace(host)
+	if host == "" {
+		return "vpn233.local"
+	}
+	if net.ParseIP(host) != nil {
+		return host
+	}
+	host = strings.ToLower(host)
+	host = strings.ReplaceAll(host, "_", "-")
+	return host
+}
+
+func yamlQuote(raw string) string {
+	return strconv.Quote(raw)
+}
+
+func renderTemplate(raw string, data any) (string, error) {
+	t, err := template.New("t").Parse(raw)
+	if err != nil {
+		return "", err
+	}
+	var b strings.Builder
+	if err := t.Execute(&b, data); err != nil {
+		return "", err
+	}
+	return b.String(), nil
+}
+
+func randomToken(n int) string {
+	const alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	if n <= 0 {
+		n = 16
+	}
+	b := make([]byte, n)
+	for i := range b {
+		num, _ := rand.Int(rand.Reader, big.NewInt(int64(len(alphabet))))
+		b[i] = alphabet[num.Int64()]
+	}
+	return string(b)
+}
+
+func randomUUID() string {
+	b, err := readRandomBytes(16)
+	if err != nil {
+		return "00000000-0000-4000-8000-000000000000"
+	}
+	b[6] = (b[6] & 0x0f) | 0x40
+	b[8] = (b[8] & 0x3f) | 0x80
+	return fmt.Sprintf("%08x-%04x-%04x-%04x-%012x",
+		b[0:4],
+		b[4:6],
+		b[6:8],
+		b[8:10],
+		b[10:16],
+	)
+}
+
+func randomHex(length int) string {
+	if length <= 0 {
+		length = 8
+	}
+	need := (length + 1) / 2
+	b, err := readRandomBytes(need)
+	if err != nil {
+		return strings.Repeat("0", length)
+	}
+	return hex.EncodeToString(b)[:length]
+}
+
+func readRandomBytes(n int) ([]byte, error) {
+	out := make([]byte, n)
+	if _, err := rand.Read(out); err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func generateRealityKeyPair() (string, string, error) {
+	curve := ecdh.X25519()
+	privateKey, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(privateKey.Bytes()), base64.RawURLEncoding.EncodeToString(privateKey.PublicKey().Bytes()), nil
+}
+
+func generateWireGuardKeys() (string, string, string, string, string, error) {
+	curve := ecdh.X25519()
+	serverPrivate, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", "", "", "", err
+	}
+	clientPrivate, err := curve.GenerateKey(rand.Reader)
+	if err != nil {
+		return "", "", "", "", "", err
+	}
+	psk, err := readRandomBytes(32)
+	if err != nil {
+		return "", "", "", "", "", err
+	}
+	return base64.StdEncoding.EncodeToString(serverPrivate.Bytes()),
+		base64.StdEncoding.EncodeToString(serverPrivate.PublicKey().Bytes()),
+		base64.StdEncoding.EncodeToString(clientPrivate.Bytes()),
+		base64.StdEncoding.EncodeToString(clientPrivate.PublicKey().Bytes()),
+		base64.StdEncoding.EncodeToString(psk),
+		nil
+}
+
+func generateSelfSignedCertificate(host string) (string, string, error) {
+	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		return "", "", err
+	}
+	serialBytes, err := readRandomBytes(16)
+	if err != nil {
+		return "", "", err
+	}
+	template := x509.Certificate{
+		SerialNumber: big.NewInt(0).SetBytes(serialBytes),
+		Subject: pkix.Name{
+			CommonName:   host,
+			Organization: []string{"vpn233"},
+		},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(3650 * 24 * time.Hour),
+		KeyUsage:              x509.KeyUsageDigitalSignature | x509.KeyUsageKeyEncipherment,
+		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth, x509.ExtKeyUsageClientAuth},
+		BasicConstraintsValid: true,
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		template.IPAddresses = append(template.IPAddresses, ip)
+	} else {
+		template.DNSNames = append(template.DNSNames, host)
+	}
+	der, err := x509.CreateCertificate(rand.Reader, &template, &template, privateKey.Public(), privateKey)
+	if err != nil {
+		return "", "", err
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	keyBytes, err := x509.MarshalECPrivateKey(privateKey)
+	if err != nil {
+		return "", "", err
+	}
+	keyPEM := pem.EncodeToMemory(&pem.Block{Type: "EC PRIVATE KEY", Bytes: keyBytes})
+	return string(certPEM), string(keyPEM), nil
+}
+
+func toSlashPath(parts ...string) string {
+	return filepath.ToSlash(filepath.Join(parts...))
+}
+
+const shellInstallTemplate = `#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+UMASK=022
+export DEBIAN_FRONTEND=noninteractive
+
+NODE_NAME="{{.NodeName}}"
+NODE_IP="{{.NodeIP}}"
+SERVER_NAME="{{.ServerName}}"
+REALITY_SERVER="{{.RealityServer}}"
+DATA_DIR="{{.DataDir}}"
+USE_MIHOMO="{{.UseMihomo}}"
+USE_SINGBOX="{{.UseSingbox}}"
+ENABLE_BBR="{{.EnableBBR}}"
+UUID="{{.UUID}}"
+PASSWORD="{{.Password}}"
+GRPC_SERVICE_NAME="{{.GRPCServiceName}}"
+REALITY_PUBLIC_KEY="{{.RealityPublicKey}}"
+REALITY_SHORT_ID="{{.RealityShortID}}"
+WG_CLIENT_KEY="{{.WireGuardClientPrivateKey}}"
+WG_SERVER_PUBLIC_KEY="{{.WireGuardServerPublicKey}}"
+WG_PRESHARED_KEY="{{.WireGuardPresharedKey}}"
+WG_CLIENT_CIDR="{{.WireGuardClientCIDR}}"
+PORT_LIST="{{.PortsCSV}}"
+PORTS_JSON='{{.PortsJSON}}'
+GENERATED_AT="{{.GeneratedAt}}"
+SINGBOX_CONFIG='{{.SingBoxConfig}}'
+MIHOMO_CONFIG='{{.MihomoConfig}}'
+
+if [[ "$EUID" -ne 0 ]]; then
+  echo "请使用 root 身份执行"
+  exit 1
+fi
+
+if command -v apt-get >/dev/null 2>&1; then
+  export INSTALLER="apt-get"
+  export PACKAGE_UPDATE="apt-get update -y"
+  export PACKAGE_INSTALL="apt-get install -y"
+elif command -v yum >/dev/null 2>&1; then
+  export INSTALLER="yum"
+  export PACKAGE_UPDATE="yum -y update"
+  export PACKAGE_INSTALL="yum -y install"
+elif command -v dnf >/dev/null 2>&1; then
+  export INSTALLER="dnf"
+  export PACKAGE_UPDATE="dnf -y update"
+  export PACKAGE_INSTALL="dnf -y install"
+else
+  echo "当前系统不支持自动安装依赖"
+fi
+
+if command -v curl >/dev/null 2>&1; then
+  :
+else
+  if [[ -n "${PACKAGE_INSTALL:-}" ]]; then
+    ${PACKAGE_UPDATE} >/dev/null 2>&1 || true
+    ${PACKAGE_INSTALL} -y curl tar gzip ca-certificates >/dev/null 2>&1
+  fi
+fi
+
+arch="$(uname -m)"
+case "$arch" in
+  x86_64|amd64)
+    SINGBOX_ARCH="amd64"
+    MIHOMO_ARCH="amd64"
+    ;;
+  aarch64|arm64)
+    SINGBOX_ARCH="arm64"
+    MIHOMO_ARCH="arm64"
+    ;;
+  *)
+    echo "不支持的架构: $arch"
+    exit 1
+    ;;
+esac
+
+mkdir -p "$DATA_DIR/singbox" "$DATA_DIR/mihomo" "$DATA_DIR/tls" "/etc/systemd/system"
+
+install_bbr() {
+  if [[ "$ENABLE_BBR" != "true" ]]; then
+    return
+  fi
+  if [[ -f /etc/sysctl.d/99-vpn233-bbr.conf ]]; then
+    return
+  fi
+  cat >/etc/sysctl.d/99-vpn233-bbr.conf <<'EOF'
+net.core.default_qdisc=fq
+net.ipv4.tcp_congestion_control=bbr
+net.core.netdev_max_backlog=32768
+net.core.rmem_max=134217728
+net.core.wmem_max=134217728
+net.ipv4.tcp_adv_win_scale=2
+net.ipv4.tcp_rmem=4096 87380 134217728
+net.ipv4.tcp_wmem=4096 65536 134217728
+net.core.somaxconn=32768
+EOF
+  sysctl --system
+  echo "已开启 BBR + TCP 优化"
+}
+
+install_dependencies() {
+  if [[ -n "${PACKAGE_INSTALL:-}" ]]; then
+    ${PACKAGE_UPDATE} >/dev/null 2>&1 || true
+    ${PACKAGE_INSTALL} -y curl jq tar gzip ca-certificates findutils >/dev/null 2>&1
+  fi
+}
+
+detect_node_ip() {
+  if [[ -n "$NODE_IP" && "$NODE_IP" != "auto" && "$NODE_IP" != "127.0.0.1" ]]; then
+    return
+  fi
+  local candidates=(
+    "https://api64.ipify.org"
+    "https://ipv4.icanhazip.com"
+    "https://ifconfig.me"
+  )
+  local ip=""
+  for url in "${candidates[@]}"; do
+    ip="$(curl -fsSL --max-time 5 "$url" 2>/dev/null | tr -d '\r\n' || true)"
+    if [[ -n "$ip" ]]; then
+      NODE_IP="$ip"
+      SERVER_NAME="$ip"
+      return
+    fi
+  done
+}
+
+enable_kernel_forwarding() {
+  cat >/etc/sysctl.d/99-vpn233-forward.conf <<'EOF'
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+}
+
+install_singbox() {
+  if [[ "$USE_SINGBOX" != "true" ]]; then
+    return
+  fi
+  local tag release_json file asset_url
+  release_json="$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest)"
+  tag="$(echo "$release_json" | jq -r .tag_name | tr -d '\\r\\n')"
+  if [[ -z "$tag" || "$tag" == "null" ]]; then
+    echo "无法获取 sing-box 版本，使用回退版本 v1.12.0"
+    tag="v1.12.0"
+  fi
+  file="$(echo "$release_json" | jq -r --arg arch "$SINGBOX_ARCH" '.assets[] | select(.name | test("linux-" + $arch + "\\.tar\\.gz$")) | .name' | head -n 1)"
+  if [[ -z "$file" || "$file" == "null" ]]; then
+    file="sing-box-${tag}-linux-${SINGBOX_ARCH}.tar.gz"
+  fi
+  asset_url="https://github.com/SagerNet/sing-box/releases/download/${tag}/$file"
+  echo "下载 sing-box $tag..."
+  curl -fL -o /tmp/$file "$asset_url"
+  tar -xzf /tmp/$file -C /tmp
+  local bin_path
+  bin_path="$(find /tmp -maxdepth 3 -type f -name sing-box | head -n 1)"
+  if [[ -z "$bin_path" ]]; then
+    echo "未找到 sing-box 可执行文件"
+    exit 1
+  fi
+  install -m 755 "$bin_path" "$DATA_DIR/singbox/sing-box"
+  cat >/etc/systemd/system/vpn233-singbox.service <<EOF
+[Unit]
+Description=vpn233-singbox
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$DATA_DIR/singbox
+ExecStart=$DATA_DIR/singbox/sing-box run -c $DATA_DIR/singbox/config.json
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+install_mihomo() {
+  if [[ "$USE_MIHOMO" != "true" ]]; then
+    return
+  fi
+  local tag release_json asset_name asset_url extracted
+  release_json="$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest)"
+  tag="$(echo "$release_json" | jq -r .tag_name | tr -d '\\r\\n')"
+  if [[ -z "$tag" || "$tag" == "null" ]]; then
+    tag="v1.18.9"
+  fi
+  asset_name="$(echo "$release_json" | jq -r --arg arch "$MIHOMO_ARCH" '.assets[] | select(.name | ascii_downcase | test("linux.*" + $arch)) | .name' | head -n 1)"
+  if [[ -z "$asset_name" || "$asset_name" == "null" ]]; then
+    asset_name="mihomo-linux-${MIHOMO_ARCH}.gz"
+  fi
+  asset_url="https://github.com/MetaCubeX/mihomo/releases/download/${tag}/${asset_name}"
+  curl -fL -o "/tmp/${asset_name}" "$asset_url" || {
+    echo "mihomo 下载失败，可能已改名，请手动检查资产"
+    return
+  }
+  extracted="/tmp/${asset_name%.gz}"
+  if [[ "$asset_name" == *.gz ]]; then
+    gzip -df "/tmp/${asset_name}"
+  fi
+  if [[ ! -f "$extracted" ]]; then
+    extracted="$(find /tmp -maxdepth 2 -type f -name 'mihomo*' | head -n 1)"
+  fi
+  if [[ -z "$extracted" || ! -f "$extracted" ]]; then
+    echo "未找到 mihomo 可执行文件"
+    return
+  fi
+  install -m 755 "$extracted" "$DATA_DIR/mihomo/mihomo"
+  cat >/etc/systemd/system/vpn233-mihomo.service <<EOF
+[Unit]
+Description=vpn233-mihomo
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$DATA_DIR/mihomo
+ExecStart=$DATA_DIR/mihomo/mihomo -d $DATA_DIR/mihomo -f $DATA_DIR/mihomo/config.yaml
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
+EOF
+}
+
+write_configs() {
+  mkdir -p "$DATA_DIR/singbox" "$DATA_DIR/mihomo" "$DATA_DIR/tls" "$DATA_DIR/runtime"
+  cat >"$DATA_DIR/tls/server.crt" <<'EOF'
+{{.TLSCertPEM}}
+EOF
+  cat >"$DATA_DIR/tls/server.key" <<'EOF'
+{{.TLSKeyPEM}}
+EOF
+  if [[ "$USE_SINGBOX" == "true" ]]; then
+    cat >"$DATA_DIR/singbox/config.json" <<EOF
+{{.SingBoxConfig}}
+EOF
+  fi
+  if [[ "$USE_MIHOMO" == "true" ]]; then
+    cat >"$DATA_DIR/mihomo/config.yaml" <<EOF
+{{.MihomoConfig}}
+EOF
+  fi
+}
+
+write_runtime_metadata() {
+  mkdir -p "$DATA_DIR/runtime"
+  jq -n \
+    --arg generated_at "$GENERATED_AT" \
+    --arg node_name "$NODE_NAME" \
+    --arg node_ip "$NODE_IP" \
+    --arg server_name "$SERVER_NAME" \
+    --arg uuid "$UUID" \
+    --arg password "$PASSWORD" \
+    --arg grpc_service_name "$GRPC_SERVICE_NAME" \
+    --arg reality_public_key "$REALITY_PUBLIC_KEY" \
+    --arg reality_short_id "$REALITY_SHORT_ID" \
+    --arg reality_server "$REALITY_SERVER" \
+    --arg wireguard_client_key "$WG_CLIENT_KEY" \
+    --arg wireguard_server_public_key "$WG_SERVER_PUBLIC_KEY" \
+    --arg wireguard_preshared_key "$WG_PRESHARED_KEY" \
+    --arg wireguard_client_cidr "$WG_CLIENT_CIDR" \
+    --argjson ports "$PORTS_JSON" \
+    '
+    def link($p):
+      if $p.id == "singbox-vless" then
+        "vless://" + $uuid + "@" + $node_ip + ":" + ($p.port|tostring) + "?security=none&type=tcp#" + $p.name
+      elif $p.id == "singbox-vless-grpc" then
+        "vless://" + $uuid + "@" + $node_ip + ":" + ($p.port|tostring) + "?security=tls&sni=" + $server_name + "&type=grpc&serviceName=" + $grpc_service_name + "#" + $p.name
+      elif $p.id == "singbox-vless-reality" then
+        "vless://" + $uuid + "@" + $node_ip + ":" + ($p.port|tostring) + "?security=reality&sni=" + $reality_server + "&pbk=" + $reality_public_key + "&sid=" + $reality_short_id + "&type=tcp#" + $p.name
+      elif $p.id == "singbox-vless-reality-grpc" then
+        "vless://" + $uuid + "@" + $node_ip + ":" + ($p.port|tostring) + "?security=reality&sni=" + $reality_server + "&pbk=" + $reality_public_key + "&sid=" + $reality_short_id + "&type=grpc&serviceName=" + $grpc_service_name + "#" + $p.name
+      elif $p.id == "singbox-trojan" then
+        "trojan://" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "?sni=" + $server_name + "#" + $p.name
+      elif $p.id == "singbox-trojan-grpc" then
+        "trojan://" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "?sni=" + $server_name + "&type=grpc&serviceName=" + $grpc_service_name + "#" + $p.name
+      elif $p.id == "singbox-shadowsocks" then
+        "ss://" + ("2022-blake3-chacha20-poly1305:" + $password | @base64) + "@" + $node_ip + ":" + ($p.port|tostring) + "#" + $p.name
+      elif $p.id == "singbox-hysteria2" then
+        "hysteria2://" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "?sni=" + $server_name + "&insecure=1#" + $p.name
+      elif $p.id == "singbox-tuic" then
+        "tuic://" + $uuid + ":" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "?sni=" + $server_name + "&congestion_control=bbr#" + $p.name
+      elif $p.id == "singbox-wireguard" then
+        "wireguard://" + $wireguard_client_key + "@" + $node_ip + ":" + ($p.port|tostring) + "?publickey=" + $wireguard_server_public_key + "&presharedkey=" + $wireguard_preshared_key + "&address=" + $wireguard_client_cidr + "#" + $p.name
+      elif $p.id == "singbox-socks" then
+        "socks5://vpn233:" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "#" + $p.name
+      elif $p.id == "singbox-http" then
+        "http://vpn233:" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "#" + $p.name
+      else empty end;
+    {
+      generated_at: $generated_at,
+      node_name: $node_name,
+      node_ip: $node_ip,
+      server_name: $server_name,
+      uuid: $uuid,
+      password: $password,
+      grpc_service_name: $grpc_service_name,
+      reality_server: $reality_server,
+      reality_public_key: $reality_public_key,
+      reality_short_id: $reality_short_id,
+      wireguard_client_private_key: $wireguard_client_key,
+      wireguard_server_public_key: $wireguard_server_public_key,
+      wireguard_preshared_key: $wireguard_preshared_key,
+      wireguard_client_cidr: $wireguard_client_cidr,
+      ports: $ports,
+      links: [$ports[] | select(.core == "singbox") | link(.)]
+    }' >"$DATA_DIR/runtime/node-manifest.json"
+  jq -r '.links[]' "$DATA_DIR/runtime/node-manifest.json" >"$DATA_DIR/runtime/links.txt"
+}
+
+install_management_cli() {
+  cat >/usr/local/bin/vpn233-node <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+DATA_DIR="$DATA_DIR"
+SINGBOX_CONFIG="\$DATA_DIR/singbox/config.json"
+MANIFEST="\$DATA_DIR/runtime/node-manifest.json"
+LINKS="\$DATA_DIR/runtime/links.txt"
+restart_services() {
+  command -v systemctl >/dev/null 2>&1 && systemctl restart vpn233-singbox vpn233-mihomo >/dev/null 2>&1 || true
+}
+edit_singbox() {
+  local filter="\$1"
+  local tmp
+  tmp="\$(mktemp)"
+  jq "\$filter" "\$SINGBOX_CONFIG" >"\$tmp"
+  mv "\$tmp" "\$SINGBOX_CONFIG"
+  restart_services
+}
+case "\${1:-help}" in
+  status)
+    command -v systemctl >/dev/null 2>&1 && systemctl status vpn233-singbox vpn233-mihomo --no-pager || true
+    ;;
+  restart)
+    restart_services
+    ;;
+  stop)
+    command -v systemctl >/dev/null 2>&1 && systemctl stop vpn233-singbox vpn233-mihomo >/dev/null 2>&1 || true
+    ;;
+  show-manifest)
+    cat "\$MANIFEST"
+    ;;
+  show-links)
+    cat "\$LINKS"
+    ;;
+  show-config)
+    cat "\$SINGBOX_CONFIG"
+    ;;
+  enable-bt-block)
+    edit_singbox '(.route.rules //= []) as \$rules | if any(\$rules[]?; (.protocol? == "bittorrent") or (.protocol? == ["bittorrent"])) then . else .route.rules += [{"protocol":"bittorrent","outbound":"block"}] end'
+    ;;
+  disable-bt-block)
+    edit_singbox '.route.rules |= map(select((.protocol? != "bittorrent") and (.protocol? != ["bittorrent"])))'
+    ;;
+  add-block-domain)
+    test -n "\${2:-}" || { echo "usage: vpn233-node add-block-domain example.com"; exit 1; }
+    edit_singbox "\$(printf '.route.rules += [{\"domain_suffix\":[\"%s\"],\"outbound\":\"block\"}]' "\$2")"
+    ;;
+  remove-block-domain)
+    test -n "\${2:-}" || { echo "usage: vpn233-node remove-block-domain example.com"; exit 1; }
+    edit_singbox "\$(printf '.route.rules |= map(if .domain_suffix? then .domain_suffix |= map(select(. != \"%s\")) else . end) | .route.rules |= map(select((.domain_suffix? | length // 1) > 0 or (.outbound? != \"block\")))' "\$2")"
+    ;;
+  reload)
+    restart_services
+    ;;
+  *)
+    cat <<USAGE
+vpn233-node status
+vpn233-node restart
+vpn233-node stop
+vpn233-node show-manifest
+vpn233-node show-links
+vpn233-node show-config
+vpn233-node enable-bt-block
+vpn233-node disable-bt-block
+vpn233-node add-block-domain example.com
+vpn233-node remove-block-domain example.com
+vpn233-node reload
+USAGE
+    ;;
+esac
+EOF
+  chmod 755 /usr/local/bin/vpn233-node
+}
+
+open_ports() {
+  for p in ${PORT_LIST//,/ }; do
+    if command -v ufw >/dev/null 2>&1; then
+      ufw allow "$p"/tcp >/dev/null 2>&1 || true
+      ufw allow "$p"/udp >/dev/null 2>&1 || true
+    elif command -v firewall-cmd >/dev/null 2>&1; then
+      firewall-cmd --zone=public --add-port="$p/tcp" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --zone=public --add-port="$p/udp" --permanent >/dev/null 2>&1 || true
+      firewall-cmd --reload >/dev/null 2>&1 || true
+    else
+      iptables -C INPUT -p tcp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport "$p" -j ACCEPT
+      iptables -C INPUT -p udp --dport "$p" -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport "$p" -j ACCEPT
+    fi
+  done
+}
+
+enable_services() {
+  if [[ "$USE_SINGBOX" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable --now vpn233-singbox >/dev/null 2>&1 || true
+  fi
+  if [[ "$USE_MIHOMO" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload
+    systemctl enable --now vpn233-mihomo >/dev/null 2>&1 || true
+  fi
+}
+
+verify_services() {
+  if [[ "$USE_SINGBOX" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet vpn233-singbox || {
+      echo "vpn233-singbox 未能成功启动"
+      journalctl -u vpn233-singbox -n 50 --no-pager || true
+      exit 1
+    }
+  fi
+  if [[ "$USE_MIHOMO" == "true" ]] && command -v systemctl >/dev/null 2>&1; then
+    systemctl is-active --quiet vpn233-mihomo || {
+      echo "vpn233-mihomo 未能成功启动"
+      journalctl -u vpn233-mihomo -n 50 --no-pager || true
+      exit 1
+    }
+  fi
+}
+
+install_dependencies
+detect_node_ip
+install_bbr
+enable_kernel_forwarding
+write_configs
+write_runtime_metadata
+install_management_cli
+open_ports
+if [[ "$USE_SINGBOX" == "true" || "$USE_MIHOMO" == "true" ]]; then
+  install_singbox
+  install_mihomo
+fi
+enable_services
+verify_services
+
+cat <<EOF
+========================================
+节点信息（仅显示关键配置）
+节点名: $NODE_NAME
+服务名: $SERVER_NAME
+UUID: $UUID
+节点口令: $PASSWORD
+gRPC 服务名: $GRPC_SERVICE_NAME
+Reality 公钥: $REALITY_PUBLIC_KEY
+Reality ShortID: $REALITY_SHORT_ID
+WireGuard 客户端私钥: $WG_CLIENT_KEY
+WireGuard 服务端公钥: $WG_SERVER_PUBLIC_KEY
+WireGuard PresharedKey: $WG_PRESHARED_KEY
+WireGuard 客户端地址: $WG_CLIENT_CIDR
+运行时清单: $DATA_DIR/runtime/node-manifest.json
+连接链接: $DATA_DIR/runtime/links.txt
+管理命令: vpn233-node
+数据目录: $DATA_DIR
+生成时间: $GENERATED_AT
+支持端口: $PORT_LIST
+========================================
+EOF
+`
+
+const ps1InstallTemplate = `#requires -version 5.1
+$ErrorActionPreference = "Stop"
+$NODE_NAME = "{{.NodeName}}"
+$NODE_IP = "{{.NodeIP}}"
+$SERVER_NAME = "{{.ServerName}}"
+$DATA_DIR = "{{.DataDir}}"
+$USE_MIHOMO = {{if .UseMihomo}}$true{{else}}$false{{end}}
+$USE_SINGBOX = {{if .UseSingbox}}$true{{else}}$false{{end}}
+$ENABLE_BBR = {{if .EnableBBR}}$true{{else}}$false{{end}}
+$PASSWORD = "{{.Password}}"
+$GRPC_SERVICE_NAME = "{{.GRPCServiceName}}"
+$REALITY_PUBLIC_KEY = "{{.RealityPublicKey}}"
+$REALITY_SHORT_ID = "{{.RealityShortID}}"
+$WG_CLIENT_KEY = "{{.WireGuardClientPrivateKey}}"
+$WG_SERVER_PUBLIC_KEY = "{{.WireGuardServerPublicKey}}"
+$WG_PRESHARED_KEY = "{{.WireGuardPresharedKey}}"
+$WG_CLIENT_CIDR = "{{.WireGuardClientCIDR}}"
+$PORT_LIST = "{{.PortsCSV}}".Split(",")
+$GeneratedAt = "{{.GeneratedAt}}"
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+  throw "请使用管理员运行 PowerShell"
+}
+
+New-Item -ItemType Directory -Path "$DATA_DIR\singbox","$DATA_DIR\mihomo","$DATA_DIR\tls" -Force | Out-Null
+
+if ($ENABLE_BBR) {
+  Set-NetTCPSetting -SettingName Internet -AutoTuningLevelNormal
+  netsh int tcp set global autotuninglevel=normal > $null
+}
+
+function Write-Config {
+  $sing = @'
+{{.SingBoxConfig}}
+'@
+  $mih = @'
+{{.MihomoConfig}}
+'@
+  $crt = @'
+{{.TLSCertPEM}}
+'@
+  $key = @'
+{{.TLSKeyPEM}}
+'@
+  $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+  [System.IO.File]::WriteAllText("$DATA_DIR\tls\server.crt", $crt, [System.Text.Encoding]::ASCII)
+  [System.IO.File]::WriteAllText("$DATA_DIR\tls\server.key", $key, [System.Text.Encoding]::ASCII)
+  if ($USE_SINGBOX) {
+    [System.IO.File]::WriteAllText("$DATA_DIR\singbox\config.json", $sing, $utf8NoBom)
+  }
+  if ($USE_MIHOMO) {
+    [System.IO.File]::WriteAllText("$DATA_DIR\mihomo\config.yaml", $mih, $utf8NoBom)
+  }
+}
+
+function Install-SingBox {
+  if (-not $USE_SINGBOX) { return }
+  $arch = (Get-CimInstance Win32_Processor).Architecture
+  if ($arch -eq 9) { $archTag = "amd64" } else { $archTag = "amd64" }
+  $tagObj = Invoke-RestMethod -Uri "https://api.github.com/repos/SagerNet/sing-box/releases/latest"
+  $tag = $tagObj.tag_name
+  $asset = "sing-box-$tag-win64.zip"
+  $tmp = Join-Path $env:TEMP $asset
+  Invoke-WebRequest -Uri "https://github.com/SagerNet/sing-box/releases/download/$tag/$asset" -OutFile $tmp
+  Expand-Archive -Path $tmp -DestinationPath (Join-Path $DATA_DIR "singbox") -Force
+  $exe = Get-ChildItem "$DATA_DIR\\singbox" -Recurse -Filter sing-box*.exe | Select-Object -First 1
+  if ($exe) {
+    $serviceCommand = '"' + $exe.FullName + '" run -c "' + $DATA_DIR + "\\singbox\\config.json"'
+    New-Service -Name "vpn233-singbox" -BinaryPathName $serviceCommand -DisplayName "vpn233-singbox" -StartupType Automatic -ErrorAction SilentlyContinue | Out-Null
+  }
+}
+
+function Install-Mihomo {
+  if (-not $USE_MIHOMO) { return }
+  $tagObj = Invoke-RestMethod -Uri "https://api.github.com/repos/MetaCubeX/mihomo/releases/latest"
+  $tag = $tagObj.tag_name
+  $asset = "mihomo-windows-amd64.exe"
+  $tmp = Join-Path $env:TEMP $asset
+  Invoke-WebRequest -Uri "https://github.com/MetaCubeX/mihomo/releases/download/$tag/$asset" -OutFile $tmp -ErrorAction SilentlyContinue
+  Copy-Item $tmp "$DATA_DIR\\mihomo\\mihomo.exe" -Force
+  $mihomoServiceCommand = '"' + $DATA_DIR + '\\mihomo\\mihomo.exe" -d "' + $DATA_DIR + '\\mihomo" -f "' + $DATA_DIR + '\\mihomo\\config.yaml"'
+  New-Service -Name "vpn233-mihomo" -BinaryPathName $mihomoServiceCommand -DisplayName "vpn233-mihomo" -StartupType Automatic -ErrorAction SilentlyContinue | Out-Null
+}
+
+function Open-Ports {
+  foreach ($p in $PORT_LIST) {
+    if (-not [string]::IsNullOrWhiteSpace($p)) {
+      New-NetFirewallRule -DisplayName "VPN233-$p" -Direction Inbound -Protocol TCP -Action Allow -LocalPort $p -Profile Any -ErrorAction SilentlyContinue | Out-Null
+      New-NetFirewallRule -DisplayName "VPN233-UDP-$p" -Direction Inbound -Protocol UDP -Action Allow -LocalPort $p -Profile Any -ErrorAction SilentlyContinue | Out-Null
+    }
+  }
+}
+
+Write-Config
+Install-SingBox
+Install-Mihomo
+Open-Ports
+Start-Service vpn233-singbox -ErrorAction SilentlyContinue
+Start-Service vpn233-mihomo -ErrorAction SilentlyContinue
+
+Write-Output "========================================"
+Write-Output "节点名: $NODE_NAME"
+Write-Output "服务名: $SERVER_NAME"
+Write-Output "口令: $PASSWORD"
+Write-Output "gRPC 服务名: $GRPC_SERVICE_NAME"
+Write-Output "Reality 公钥: $REALITY_PUBLIC_KEY"
+Write-Output "Reality ShortID: $REALITY_SHORT_ID"
+Write-Output "WireGuard 客户端私钥: $WG_CLIENT_KEY"
+Write-Output "WireGuard 服务端公钥: $WG_SERVER_PUBLIC_KEY"
+Write-Output "WireGuard PresharedKey: $WG_PRESHARED_KEY"
+Write-Output "WireGuard 客户端地址: $WG_CLIENT_CIDR"
+Write-Output "数据目录: $DATA_DIR"
+Write-Output "端口列表: $($PORT_LIST -join ',')"
+Write-Output "生成时间: $GeneratedAt"
+Write-Output "========================================"
+`
+

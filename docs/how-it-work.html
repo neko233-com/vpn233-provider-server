@@ -1,0 +1,314 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>VPN233 运行原理动画演示</title>
+  <style>
+    :root {
+      --bg: #0b1220;
+      --card: rgba(15, 23, 42, 0.95);
+      --line: #3b82f6;
+      --text: #e2e8f0;
+      --soft: #94a3b8;
+      --ok: #22c55e;
+      --warn: #f59e0b;
+      --bad: #f43f5e;
+      font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+    }
+
+    html, body {
+      margin: 0;
+      background: radial-gradient(1200px 500px at 10% 10%, #1e3a8a44, transparent), var(--bg);
+      color: var(--text);
+      min-height: 100%;
+    }
+    .wrap { max-width: 1200px; margin: 0 auto; padding: 24px; }
+    .card {
+      background: var(--card);
+      border: 1px solid #334155;
+      border-radius: 14px;
+      padding: 16px;
+      margin-bottom: 14px;
+    }
+    h1, h2, h3 { margin-top: 0; }
+    .line {
+      display: flex;
+      gap: 12px;
+      align-items: center;
+      margin: 14px 0;
+      flex-wrap: wrap;
+    }
+    .box {
+      background: linear-gradient(160deg, #0f172a, #111827);
+      border: 1px solid #334155;
+      border-radius: 10px;
+      padding: 12px;
+      min-width: 160px;
+      flex: 1;
+      min-height: 84px;
+      position: relative;
+      overflow: hidden;
+      transition: transform 180ms ease, box-shadow 180ms ease;
+      box-shadow: inset 0 1px 0 #33415555;
+    }
+    .box b { display: block; margin-bottom: 6px; color: #93c5fd; }
+    .pulse {
+      animation: pulse 1.2s ease-in-out infinite alternate;
+      border-color: var(--line);
+      box-shadow: 0 0 0 0 #3b82f655;
+      transform: scale(1.01);
+    }
+    @keyframes pulse {
+      to { box-shadow: 0 0 0 8px #3b82f600; transform: scale(1.02); }
+    }
+    .arrow {
+      width: 80px;
+      height: 1px;
+      border-top: 2px dashed #64748b;
+      position: relative;
+    }
+    .arrow::after {
+      content: "";
+      position: absolute;
+      right: -8px;
+      top: -7px;
+      border: 8px solid transparent;
+      border-left-color: #64748b;
+    }
+
+    .chips {
+      display: flex;
+      gap: 8px;
+      flex-wrap: wrap;
+      margin-top: 8px;
+    }
+    .chip { padding: 6px 10px; border-radius: 999px; background: #1d4ed820; border: 1px solid #1d4ed8; }
+    .chip.on { border-color: var(--ok); background: #15803d20; }
+    .stack { display: flex; gap: 10px; align-items: center; }
+    button { margin-top: 6px; padding: 10px 14px; border-radius: 10px; background: #2563eb; color: #fff; border: none; font-weight: 600; cursor: pointer; }
+    button:hover { background: #1d4ed8; }
+    pre {
+      margin: 0;
+      background: #020617;
+      border: 1px solid #1e293b;
+      padding: 12px;
+      border-radius: 12px;
+      overflow: auto;
+      color: #93c5fd;
+      font-size: 13px;
+    }
+    .good { color: var(--ok); }
+    .bad { color: var(--bad); }
+    .muted { color: var(--soft); font-size: 13px; }
+    .mini { font-size: 12px; color: #a1a1aa; }
+    .diagram-svg { width: 100%; height: auto; }
+    .protocol-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px,1fr)); gap: 10px; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <h1>VPN233 一键部署与订阅验证流程</h1>
+    <p class="muted">面向管理员的“傻瓜式部署 + 订阅验证”展示（agent-first 控制面板版本）。</p>
+
+    <div class="card">
+      <h2>1. 整体协作流</h2>
+      <div class="line">
+        <div class="box" id="step-ui">
+          <b>管理台</b>
+          <span>登录 -> 勾选协议 -> 生成脚本</span>
+        </div>
+        <div class="arrow"></div>
+        <div class="box" id="step-shell">
+          <b>脚本下发</b>
+          <span>GET 裸脚本下载 + bash/ps1 写入服务与配置</span>
+        </div>
+        <div class="arrow"></div>
+        <div class="box" id="step-runtime">
+          <b>边缘节点</b>
+          <span>mihomo/sing-box 启动、端口开放、BBR 优化</span>
+        </div>
+        <div class="arrow"></div>
+        <div class="box" id="step-sub">
+          <b>订阅服务器</b>
+          <span>对接 /api/v1/subscribe/verify</span>
+        </div>
+      </div>
+      <p id="flowText" class="muted"></p>
+    </div>
+
+    <div class="card">
+      <h2>2. 订阅服务器校验机制</h2>
+      <p class="muted">每次订阅服务启动或更新前可执行验证，确认 provider 已具备基础能力。</p>
+      <div class="stack">
+        <pre id="verifyCurl">curl -s http://127.0.0.1:8080/api/v1/subscribe/verify?token=YOUR_VERIFY_TOKEN | jq .</pre>
+      </div>
+      <div class="stack" style="margin-top:10px;">
+        <pre>curl -sL -H "Authorization: Bearer TOKEN" "http://127.0.0.1:8080/api/v1/generate?format=sh&node_name=edge-a&node_ip=203.0.113.8&selected_protocols=singbox-vless-grpc,singbox-vless-reality-grpc,mihomo-vless-grpc" -o edge-a-install.sh</pre>
+      </div>
+      <div id="verifySample" class="muted mini"></div>
+    </div>
+
+    <div class="card">
+      <h2>3. 一键动画（协议层）</h2>
+      <div class="chips" id="protocolList"></div>
+      <div class="line" style="align-items: stretch; margin-top:14px;">
+        <div class="box" style="flex: 2">
+          <b>连接轨迹（动画）</b>
+          <svg class="diagram-svg" viewBox="0 0 780 150" aria-label="protocol-animation">
+            <defs>
+              <linearGradient id="g1" x1="0" x2="1">
+                <stop offset="0%" stop-color="#60a5fa" />
+                <stop offset="100%" stop-color="#22c55e" />
+              </linearGradient>
+            </defs>
+            <rect x="10" y="40" width="760" height="70" rx="12" fill="#0b1220" stroke="#334155"></rect>
+            <circle id="ball" cx="70" cy="75" r="10" fill="url(#g1)"></circle>
+            <text x="50" y="25" fill="#94a3b8" font-size="12">客户端</text>
+            <text x="350" y="25" fill="#94a3b8" font-size="12">传输层</text>
+            <text x="650" y="25" fill="#94a3b8" font-size="12">边缘节点/规则引擎</text>
+            <path id="path1" d="M 100 75 C 220 35 360 115 500 75" stroke="none"></path>
+          </svg>
+          <p id="protocolDesc" class="mini"></p>
+        </div>
+        <div class="box" style="flex:1; min-width: 180px;">
+          <b>状态</b>
+          <div id="protocolState" class="mini">准备播放</div>
+          <div id="protoHint" class="mini muted"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>4. Mihomo / Sing-box 协议示例映射</h2>
+      <div class="protocol-grid" id="protocolMap"></div>
+    </div>
+  </div>
+
+  <script>
+    const protocolList = document.getElementById("protocolList");
+    const protocols = [
+      { id: "singbox-vless", name: "VLESS-TCP", type: "singbox", detail: "基础 TCP 入口，适合最稳妥的起步部署。", stage: "入口协议" },
+      { id: "singbox-vless-grpc", name: "VLESS-gRPC", type: "singbox", detail: "自签 TLS + gRPC，适合与 L7 代理协同。", stage: "gRPC 通道" },
+      { id: "singbox-vless-reality", name: "VLESS-Reality", type: "singbox", detail: "免域名 Reality，减少证书运维成本。", stage: "Reality 入口" },
+      { id: "singbox-vless-reality-grpc", name: "VLESS-Reality-gRPC", type: "singbox", detail: "Reality + gRPC + 重放防护组合模板。", stage: "前沿组合" },
+      { id: "singbox-vmess", name: "VMess-TCP", type: "singbox", detail: "历史兼容协议，便于老客户端迁移。", stage: "兼容入口" },
+      { id: "singbox-vmess-ws", name: "VMess-WS", type: "singbox", detail: "WebSocket + TLS 组合，兼容旧前端链路。", stage: "WS 通道" },
+      { id: "singbox-trojan", name: "Trojan", type: "singbox", detail: "标准 Trojan TLS 入站。", stage: "TLS 伪装" },
+      { id: "singbox-trojan-grpc", name: "Trojan-gRPC", type: "singbox", detail: "Trojan 走 gRPC，便于统一转发层。", stage: "gRPC 通道" },
+      { id: "singbox-shadowsocks", name: "Shadowsocks", type: "singbox", detail: "Shadowsocks 2022，部署简单。", stage: "加密传输" },
+      { id: "singbox-hysteria2", name: "Hysteria2", type: "singbox", detail: "QUIC 大吞吐模板。", stage: "QUIC 通道" },
+      { id: "singbox-tuic", name: "TUIC", type: "singbox", detail: "自带抗重放与 BBR 适配。", stage: "UDP 入口" },
+      { id: "singbox-wireguard", name: "WireGuard", type: "singbox", detail: "标准 WireGuard 服务端模板。", stage: "TUN 入口" },
+      { id: "singbox-socks", name: "SOCKS5", type: "singbox", detail: "密码式 SOCKS5，便于跳板复用。", stage: "应用兼容层" },
+      { id: "singbox-http", name: "HTTP", type: "singbox", detail: "密码式 HTTP CONNECT 入站。", stage: "应用兼容层" },
+      { id: "mihomo-vless", name: "Mihomo-VLESS", type: "mihomo", detail: "VLESS TCP 出站模板，适合快速接管策略。", stage: "策略模板" },
+      { id: "mihomo-vless-grpc", name: "Mihomo-VLESS-gRPC", type: "mihomo", detail: "VLESS gRPC 出站，支持统一 service_name。", stage: "策略模板" },
+      { id: "mihomo-vless-reality-grpc", name: "Mihomo-VLESS-Reality-gRPC", type: "mihomo", detail: "Reality 公钥 + ShortID 直接接入。", stage: "Reality 策略" },
+      { id: "mihomo-vmess", name: "Mihomo-VMess", type: "mihomo", detail: "VMess TCP 出站。", stage: "策略模板" },
+      { id: "mihomo-vmess-ws", name: "Mihomo-VMess-WS", type: "mihomo", detail: "VMess WebSocket 出站模板。", stage: "WS 策略" },
+      { id: "mihomo-trojan", name: "Mihomo-Trojan", type: "mihomo", detail: "Trojan TLS 出站模板。", stage: "TLS 策略" },
+      { id: "mihomo-trojan-grpc", name: "Mihomo-Trojan-gRPC", type: "mihomo", detail: "Trojan gRPC 出站模板。", stage: "gRPC 策略" },
+      { id: "mihomo-shadowsocks", name: "Mihomo-Shadowsocks", type: "mihomo", detail: "Shadowsocks 2022 出站模板。", stage: "加密策略" },
+      { id: "mihomo-hysteria2", name: "Mihomo-Hysteria2", type: "mihomo", detail: "QUIC 出站模板。", stage: "QUIC 策略" },
+      { id: "mihomo-tuic", name: "Mihomo-TUIC", type: "mihomo", detail: "TUIC 出站模板。", stage: "UDP 策略" },
+      { id: "mihomo-wireguard", name: "Mihomo-WireGuard", type: "mihomo", detail: "WireGuard 出站模板。", stage: "TUN 策略" }
+    ];
+    const flowText = document.getElementById("flowText");
+    const stateUI = [document.getElementById("step-ui"), document.getElementById("step-shell"), document.getElementById("step-runtime"), document.getElementById("step-sub")];
+    const verifySample = document.getElementById("verifySample");
+    const protocolDesc = document.getElementById("protocolDesc");
+    const protocolState = document.getElementById("protocolState");
+    const protoHint = document.getElementById("protoHint");
+    const mapRoot = document.getElementById("protocolMap");
+    const ball = document.getElementById("ball");
+
+    function renderProtocolCards() {
+      protocols.forEach((p, idx) => {
+        const el = document.createElement("button");
+        el.style.border = "1px solid #334155";
+        el.style.borderRadius = "999px";
+        el.style.background = "#111827";
+        el.style.color = "#e2e8f0";
+        el.style.padding = "8px 14px";
+        el.style.cursor = "pointer";
+        el.innerText = `${p.name} (${p.type})`;
+        el.onclick = () => {
+          startProtocolAnimation(idx);
+        };
+        protocolList.appendChild(el);
+      });
+    }
+
+    function renderMap() {
+      protocols.forEach((p, idx) => {
+        const panel = document.createElement("div");
+        panel.className = "box";
+        panel.innerHTML = `<b>${p.name}</b><div class="mini">${p.type}</div><div class="muted">${p.detail}</div><div class="mini">${p.stage}</div>`;
+        mapRoot.appendChild(panel);
+      });
+    }
+
+    function pulse(idx) {
+      flowText.textContent = "运行状态推进中…";
+      stateUI.forEach((el, i) => {
+        el.classList.remove("pulse");
+        if (i <= idx) {
+          el.classList.add("pulse");
+        }
+      });
+    }
+
+    function animateBall() {
+      let start = 60;
+      let dir = 1;
+      let tick = 0;
+      const frames = 80;
+      const timer = setInterval(() => {
+        start += dir * 7;
+        if (start > 700) dir = -1;
+        if (start < 60) {
+          start = 60; dir = 1; tick += 1;
+          if (tick >= 2) clearInterval(timer);
+        }
+        ball.setAttribute("cx", String(start));
+      }, 18);
+    }
+
+    function startProtocolAnimation(idx) {
+      const p = protocols[idx];
+      protocolDesc.textContent = p.detail;
+      protocolState.textContent = `当前演示：${p.name}`;
+      protoHint.innerHTML = `<span class="good">✓</span> ${p.stage}`;
+      pulse(Math.min(idx, 3));
+      animateBall();
+      protocolState.className = "mini good";
+      setTimeout(() => {
+        protocolState.className = "mini";
+        protocolState.textContent = "演示完成，可切换下一个协议。";
+      }, 3000);
+    }
+
+    function updateVerifyExample() {
+      verifySample.textContent = "期望结果：ok=true + git_root + repo_state + protocols[]，并可直接通过 GET /api/v1/generate 输出裸脚本。";
+    }
+
+    function autoplay() {
+      let i = 0;
+      setInterval(() => {
+        protocolList.children[i % protocols.length].classList.remove("active");
+        startProtocolAnimation(i % protocols.length);
+        i++;
+      }, 4500);
+    }
+
+    renderProtocolCards();
+    renderMap();
+    updateVerifyExample();
+    setTimeout(() => {
+      startProtocolAnimation(0);
+      autoplay();
+    }, 1200);
+  </script>
+</body>
+</html>

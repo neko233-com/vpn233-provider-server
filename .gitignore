@@ -1,0 +1,8 @@
+agent-config.json
+*.tmp
+proto-check.err
+proto-check.out
+server-debug.log
+server-debug.log.err
+server-test.err
+server-test.log
