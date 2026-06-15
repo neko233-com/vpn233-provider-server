@@ -314,6 +314,105 @@ func TestRunCLIGenerateShell(t *testing.T) {
 	}
 }
 
+func TestProtocolListDomainDefaultsPreferAnyTLS(t *testing.T) {
+	state := &AppState{
+		cfg:        defaultConfig(),
+		tokenUntil: make(map[string]time.Time),
+	}
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/protocols?node_ip=panel.example.com", nil)
+	rec := httptest.NewRecorder()
+	state.protocolListHandler(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expect 200, got %d", rec.Code)
+	}
+	var items []ProtocolCatalog
+	if err := json.NewDecoder(rec.Body).Decode(&items); err != nil {
+		t.Fatalf("decode protocol list failed: %v", err)
+	}
+	foundAnyTLS := false
+	foundReality := false
+	for _, item := range items {
+		if item.ID == "singbox-anytls" && item.Default {
+			foundAnyTLS = true
+		}
+		if item.ID == "singbox-vless-reality" && item.Default {
+			foundReality = true
+		}
+	}
+	if !foundAnyTLS {
+		t.Fatalf("expected domain mode to default to AnyTLS")
+	}
+	if foundReality {
+		t.Fatalf("did not expect domain mode to default to Reality")
+	}
+}
+
+func TestGenerateArtifactsDomainAutoDefaultsToAnyTLS(t *testing.T) {
+	state := &AppState{
+		cfg:        defaultConfig(),
+		tokenUntil: make(map[string]time.Time),
+	}
+	req := InstallRequest{
+		NodeName:   "domain-node",
+		NodeIP:     "panel.example.com",
+		UseSingbox: boolPtr(true),
+		UseMihomo:  boolPtr(true),
+	}
+	res, err := state.generateArtifacts(req)
+	if err != nil {
+		t.Fatalf("generate artifacts failed: %v", err)
+	}
+	foundSingboxAnyTLS := false
+	foundMihomoAnyTLS := false
+	for _, p := range res.Node.Ports {
+		if p.ID == "singbox-anytls" {
+			foundSingboxAnyTLS = true
+		}
+		if p.ID == "mihomo-anytls" {
+			foundMihomoAnyTLS = true
+		}
+	}
+	if !foundSingboxAnyTLS || !foundMihomoAnyTLS {
+		t.Fatalf("expected domain mode AnyTLS defaults, got %+v", res.Node.Ports)
+	}
+	if !strings.Contains(strings.Join(res.Node.Links, "\n"), "anytls://") {
+		t.Fatalf("expected AnyTLS connection link")
+	}
+}
+
+func TestGenerateArtifactsNoDomainAutoDefaultsToReality(t *testing.T) {
+	state := &AppState{
+		cfg:        defaultConfig(),
+		tokenUntil: make(map[string]time.Time),
+	}
+	req := InstallRequest{
+		NodeName:   "ip-node",
+		NodeIP:     "203.0.113.30",
+		UseSingbox: boolPtr(true),
+		UseMihomo:  boolPtr(true),
+	}
+	res, err := state.generateArtifacts(req)
+	if err != nil {
+		t.Fatalf("generate artifacts failed: %v", err)
+	}
+	foundReality := false
+	foundAnyTLS := false
+	for _, p := range res.Node.Ports {
+		if p.ID == "singbox-vless-reality" || p.ID == "singbox-vless-reality-grpc" {
+			foundReality = true
+		}
+		if p.ID == "singbox-anytls" || p.ID == "mihomo-anytls" {
+			foundAnyTLS = true
+		}
+	}
+	if !foundReality {
+		t.Fatalf("expected no-domain mode to include Reality defaults, got %+v", res.Node.Ports)
+	}
+	if foundAnyTLS {
+		t.Fatalf("did not expect no-domain mode to auto-select AnyTLS")
+	}
+}
+
 func boolPtr(v bool) *bool {
 	return &v
 }

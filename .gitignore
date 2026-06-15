@@ -1,5 +1,7 @@
 agent-config.json
 *.tmp
+*.exe
+/vpn233-provider-server
 proto-check.err
 proto-check.out
 server-debug.log

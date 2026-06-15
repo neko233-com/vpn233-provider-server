@@ -89,4 +89,22 @@ curl -sf "http://127.0.0.1:$PORT/api/v1/protocols" | head -n 1
 echo "[verify] subscribe verify"
 curl -sf "http://127.0.0.1:$PORT/api/v1/subscribe/verify?token=$VERIFY_TOKEN" | head -n 1
 
+echo "[verify] protocols include nekotls"
+curl -sf "http://127.0.0.1:$PORT/api/v1/protocols" | grep -q "nekotls" || { echo "[verify] nekotls missing from catalog"; exit 1; }
+
+echo "[verify] subscribe convert clash-meta-nekotls"
+CONVERT=$(curl -sf "http://127.0.0.1:$PORT/api/v1/subscribe/convert?target=clash-meta-nekotls&node_ip=203.0.113.10&use_mihomo=true&token=$VERIFY_TOKEN")
+if ! echo "$CONVERT" | grep -q "type: nekotls"; then
+  echo "[verify] nekotls subscribe conversion missing type: nekotls"
+  exit 1
+fi
+echo "[verify] nekotls subscribe conversion ok"
+
+echo "[verify] node generation features"
+GEN=$(curl -sf "http://127.0.0.1:$PORT/api/v1/local/generate.sh?node_name=v&node_ip=edge.example.com&enable_acme=true&acme_domain=edge.example.com&selected_protocols=singbox-nekotls")
+for kw in tune_performance apply_security_hardening install_watchdog issue_acme_cert; do
+  echo "$GEN" | grep -q "$kw" || { echo "[verify] generated node script missing $kw"; exit 1; }
+done
+echo "[verify] node generation features ok"
+
 echo "[verify] done"

@@ -29,41 +29,62 @@ import (
 )
 
 type ServerConfig struct {
-	ListenAddr        string `json:"listen_addr"`
-	ListenPort        int    `json:"listen_port"`
-	AdminUser         string `json:"admin_user"`
-	AdminPassword     string `json:"admin_password"`
-	DefaultDataDir    string `json:"default_data_dir"`
-	DefaultNodeIP     string `json:"default_node_ip"`
-	DefaultPortBase   int    `json:"default_port_base"`
-	DefaultEnableBBR  bool   `json:"default_enable_bbr"`
-	DefaultUseMihomo  bool   `json:"default_use_mihomo"`
-	DefaultUseSingbox bool   `json:"default_use_singbox"`
-	SubscribeRepoURL  string `json:"subscribe_repo_url"`
-	SubscribeRepoPath string `json:"subscribe_repo_path"`
-	SubscribeRepoBranch string `json:"subscribe_repo_branch"`
+	ListenAddr           string `json:"listen_addr"`
+	ListenPort           int    `json:"listen_port"`
+	AdminUser            string `json:"admin_user"`
+	AdminPassword        string `json:"admin_password"`
+	DefaultDataDir       string `json:"default_data_dir"`
+	DefaultNodeIP        string `json:"default_node_ip"`
+	DefaultPortBase      int    `json:"default_port_base"`
+	DefaultEnableBBR     bool   `json:"default_enable_bbr"`
+	DefaultUseMihomo     bool   `json:"default_use_mihomo"`
+	DefaultUseSingbox    bool   `json:"default_use_singbox"`
+	SubscribeRepoURL     string `json:"subscribe_repo_url"`
+	SubscribeRepoPath    string `json:"subscribe_repo_path"`
+	SubscribeRepoBranch  string `json:"subscribe_repo_branch"`
 	SubscribeVerifyToken string `json:"subscribe_verify_token"`
 }
 
 type ProtocolCatalog struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Core        string `json:"core"`
-	Description string `json:"description"`
-	Default     bool   `json:"default"`
+	ID              string `json:"id"`
+	Name            string `json:"name"`
+	Core            string `json:"core"`
+	Description     string `json:"description"`
+	Default         bool   `json:"default"`
+	DefaultDomain   bool   `json:"default_domain"`
+	DefaultNoDomain bool   `json:"default_no_domain"`
+	NeedsDomain     bool   `json:"needs_domain"`
+	NeedsTLS        bool   `json:"needs_tls"`
+	SupportsECH     bool   `json:"supports_ech"`
+	SupportsReality bool   `json:"supports_reality"`
+	SecurityLevel   string `json:"security_level"`
+	RecommendedWhen string `json:"recommended_when"`
+	Extensible      bool   `json:"extensible"`
+	SubscribeTarget string `json:"subscribe_target,omitempty"`
 }
 
 type InstallRequest struct {
-	NodeName           string   `json:"node_name"`
-	NodeIP             string   `json:"node_ip"`
-	UseMihomo          *bool    `json:"use_mihomo"`
-	UseSingbox         *bool    `json:"use_singbox"`
-	EnableBBR          *bool    `json:"enable_bbr"`
-	PortBase           int      `json:"port_base"`
-	AdminPassword      string   `json:"admin_password"`
-	UUID               string   `json:"uuid"`
-	Password           string   `json:"password"`
-	SelectedProtocols  []string `json:"selected_protocols"`
+	NodeName          string   `json:"node_name"`
+	NodeIP            string   `json:"node_ip"`
+	UseMihomo         *bool    `json:"use_mihomo"`
+	UseSingbox        *bool    `json:"use_singbox"`
+	EnableBBR         *bool    `json:"enable_bbr"`
+	EnableTCPFastOpen *bool    `json:"enable_tcp_fastopen"`
+	EnableMPTCP       *bool    `json:"enable_mptcp"`
+	EnableHardening   *bool    `json:"enable_hardening"`
+	EnableFail2ban    *bool    `json:"enable_fail2ban"`
+	EnableLogRotate   *bool    `json:"enable_logrotate"`
+	EnableWatchdog    *bool    `json:"enable_watchdog"`
+	EnableACME        *bool    `json:"enable_acme"`
+	ACMEDomain        string   `json:"acme_domain"`
+	ACMEEmail         string   `json:"acme_email"`
+	TCPCongestion     string   `json:"tcp_congestion"`
+	ConnLimit         int      `json:"conn_limit"`
+	PortBase          int      `json:"port_base"`
+	AdminPassword     string   `json:"admin_password"`
+	UUID              string   `json:"uuid"`
+	Password          string   `json:"password"`
+	SelectedProtocols []string `json:"selected_protocols"`
 }
 
 type AuthRequest struct {
@@ -72,10 +93,10 @@ type AuthRequest struct {
 }
 
 type ProtocolPort struct {
-	ID      string
-	Name    string
-	Core    string
-	Port    int
+	ID   string
+	Name string
+	Core string
+	Port int
 }
 
 type generateResult struct {
@@ -90,6 +111,8 @@ type generateResult struct {
 		GRPCServiceName       string         `json:"grpc_service_name"`
 		RealityPublicKey      string         `json:"reality_public_key"`
 		RealityShortID        string         `json:"reality_short_id"`
+		NekoTLSPublicName     string         `json:"nekotls_public_name,omitempty"`
+		NekoTLSECHConfig      string         `json:"nekotls_ech_config,omitempty"`
 		WireGuardClientKey    string         `json:"wireguard_client_private_key"`
 		WireGuardPresharedKey string         `json:"wireguard_preshared_key"`
 		WireGuardClientCIDR   string         `json:"wireguard_client_cidr"`
@@ -98,6 +121,8 @@ type generateResult struct {
 		Ports                 []ProtocolPort `json:"ports"`
 		Links                 []string       `json:"links"`
 	} `json:"node"`
+	profile normalizedRequest
+	mapping []ProtocolPort
 }
 
 type AppState struct {
@@ -161,6 +186,7 @@ const dashboardHTML = `<!doctype html>
       </div>
       <label><input type="checkbox" id="enableBBR" checked> 开启 BBR 与常用 TCP 优化</label>
       <h4>协议选择</h4>
+      <p id="strategyHint" class="ok"></p>
       <div class="protocols" id="protocolList"></div>
       <button id="genBtn">生成一键脚本</button>
       <p id="genMsg"></p>
@@ -194,21 +220,42 @@ document.getElementById("loginBtn").onclick = async () => {
 const loadProtocols = async () => {
   const list = document.getElementById("protocolList");
   list.innerHTML = "加载中...";
-  const r = await api("/api/v1/protocols");
+  const nodeIP = document.getElementById("nodeIP").value || "auto";
+  const r = await api("/api/v1/protocols?node_ip=" + encodeURIComponent(nodeIP));
   const j = await r.json();
   if(!r.ok){list.textContent = "加载失败"; return;}
   list.innerHTML = "";
+  const useDomainMode = (() => {
+    const raw = (nodeIP || "").trim();
+    if(!raw || raw === "auto"){ return false; }
+    if(/^\d+\.\d+\.\d+\.\d+$/.test(raw)){ return false; }
+    if(raw.includes(":") && /^[0-9a-fA-F:]+$/.test(raw)){ return false; }
+    return raw.includes(".");
+  })();
+  document.getElementById("strategyHint").textContent = useDomainMode
+    ? "检测到域名模式：旗舰默认 NekoTLS（ECH 隐藏 SNI），并保留 AnyTLS 兼容位。换成 ACME 正式证书安全等级最高。"
+    : "检测到免域名模式：旗舰默认 NekoTLS（Reality 借壳）+ VLESS-Reality。傻瓜化一键落地。";
   j.forEach(p => {
     const box = document.createElement("label");
     const id = "p_"+p.id;
     const checked = p.default ? ' checked' : '';
-    box.innerHTML = '<input type="checkbox" id="' + id + '"' + checked + '> ' + p.name + ' <small>（' + p.core + '）</small>';
+    const meta = [];
+    if (p.recommended_when) meta.push('推荐: ' + p.recommended_when);
+    if (p.security_level) meta.push('安全: ' + p.security_level);
+    if (p.needs_domain) meta.push('需域名');
+    else meta.push('免域名可落地');
+    if (p.supports_reality) meta.push('支持 Reality');
+    if (p.supports_ech) meta.push('支持 ECH');
+    if (p.extensible) meta.push('可扩展');
+    if (p.subscribe_target) meta.push('订阅: ' + p.subscribe_target);
+    box.innerHTML = '<input type="checkbox" id="' + id + '"' + checked + '> ' + p.name + ' <small>（' + p.core + '）</small><div style="font-size:12px;color:#94a3b8;margin-top:6px;">' + p.description + '</div><div style="font-size:11px;color:#64748b;margin-top:4px;">' + meta.join(' · ') + '</div>';
     box.style.border = "1px solid #334155";
     box.style.borderRadius = "8px";
     box.style.padding = "8px";
     list.appendChild(box);
   });
 };
+document.getElementById("nodeIP").addEventListener("change", loadProtocols);
 
 document.getElementById("genBtn").onclick = async () => {
   const checked = [];
@@ -246,31 +293,35 @@ document.getElementById("copyPs").onclick = async () => {
 </html>`
 
 var protocolCatalog = []ProtocolCatalog{
-	{ID: "singbox-vless", Name: "VLESS-TCP", Core: "singbox", Description: "可直接启动的 VLESS TCP 入站", Default: true},
-	{ID: "singbox-vless-grpc", Name: "VLESS-gRPC", Core: "singbox", Description: "自签 TLS + gRPC 服务名模板", Default: true},
-	{ID: "singbox-vless-reality", Name: "VLESS-Reality", Core: "singbox", Description: "Reality TCP 入站，免域名可用", Default: true},
-	{ID: "singbox-vless-reality-grpc", Name: "VLESS-Reality-gRPC", Core: "singbox", Description: "Reality + gRPC + 重放防护参数模板", Default: true},
-	{ID: "singbox-vmess", Name: "VMess-TCP", Core: "singbox", Description: "标准 VMess TCP 入站", Default: false},
-	{ID: "singbox-vmess-ws", Name: "VMess-WS", Core: "singbox", Description: "WS + TLS 入站模板", Default: false},
-	{ID: "singbox-trojan", Name: "Trojan", Core: "singbox", Description: "Trojan TLS 入站模板", Default: true},
-	{ID: "singbox-trojan-grpc", Name: "Trojan-gRPC", Core: "singbox", Description: "Trojan + gRPC 入站模板", Default: false},
-	{ID: "singbox-shadowsocks", Name: "Shadowsocks", Core: "singbox", Description: "Shadowsocks 2022 直出模板", Default: true},
-	{ID: "singbox-hysteria2", Name: "Hysteria2", Core: "singbox", Description: "QUIC/Hysteria2 自签证书模板", Default: false},
-	{ID: "singbox-tuic", Name: "TUIC", Core: "singbox", Description: "TUIC + BBR 模板", Default: false},
-	{ID: "singbox-wireguard", Name: "WireGuard", Core: "singbox", Description: "WireGuard 服务端模板", Default: false},
-	{ID: "singbox-socks", Name: "SOCKS5", Core: "singbox", Description: "带密码的 SOCKS5 入站", Default: false},
-	{ID: "singbox-http", Name: "HTTP", Core: "singbox", Description: "带密码的 HTTP CONNECT 入站", Default: false},
-	{ID: "mihomo-vless", Name: "Mihomo-VLESS", Core: "mihomo", Description: "VLESS TCP 出站管理模板", Default: true},
-	{ID: "mihomo-vless-grpc", Name: "Mihomo-VLESS-gRPC", Core: "mihomo", Description: "VLESS gRPC 出站模板", Default: true},
-	{ID: "mihomo-vless-reality-grpc", Name: "Mihomo-VLESS-Reality-gRPC", Core: "mihomo", Description: "Reality + gRPC 出站模板", Default: true},
-	{ID: "mihomo-vmess", Name: "Mihomo-VMess", Core: "mihomo", Description: "VMess TCP 出站模板", Default: false},
-	{ID: "mihomo-vmess-ws", Name: "Mihomo-VMess-WS", Core: "mihomo", Description: "VMess WS 出站模板", Default: false},
-	{ID: "mihomo-trojan", Name: "Mihomo-Trojan", Core: "mihomo", Description: "Trojan TLS 出站模板", Default: true},
-	{ID: "mihomo-trojan-grpc", Name: "Mihomo-Trojan-gRPC", Core: "mihomo", Description: "Trojan gRPC 出站模板", Default: false},
-	{ID: "mihomo-shadowsocks", Name: "Mihomo-Shadowsocks", Core: "mihomo", Description: "Shadowsocks 2022 出站模板", Default: true},
-	{ID: "mihomo-hysteria2", Name: "Mihomo-Hysteria2", Core: "mihomo", Description: "Hysteria2 出站模板", Default: false},
-	{ID: "mihomo-tuic", Name: "Mihomo-TUIC", Core: "mihomo", Description: "TUIC 出站模板", Default: false},
-	{ID: "mihomo-wireguard", Name: "Mihomo-WireGuard", Core: "mihomo", Description: "WireGuard 出站模板", Default: false},
+	{ID: "singbox-vless", Name: "VLESS-TCP", Core: "singbox", Description: "可直接启动的 VLESS TCP 入站", Default: true, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "兼容优先", Extensible: true},
+	{ID: "singbox-vless-grpc", Name: "VLESS-gRPC", Core: "singbox", Description: "自签 TLS + gRPC 服务名模板", Default: true, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "需要 gRPC", Extensible: true},
+	{ID: "singbox-vless-reality", Name: "VLESS-Reality", Core: "singbox", Description: "Reality TCP 入站，免域名可用", Default: true, DefaultNoDomain: true, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: true, SupportsECH: false, SecurityLevel: "high", RecommendedWhen: "无域名默认", Extensible: true},
+	{ID: "singbox-vless-reality-grpc", Name: "VLESS-Reality-gRPC", Core: "singbox", Description: "Reality + gRPC + 重放防护参数模板", Default: true, DefaultNoDomain: true, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: true, SupportsECH: false, SecurityLevel: "high", RecommendedWhen: "无域名 + gRPC", Extensible: true},
+	{ID: "singbox-anytls", Name: "AnyTLS", Core: "singbox", Description: "AnyTLS 入站模板，域名模式优先推荐", Default: false, DefaultNoDomain: false, DefaultDomain: true, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "high-with-real-cert", RecommendedWhen: "有域名默认", Extensible: true},
+	{ID: "singbox-nekotls", Name: "NekoTLS", Core: "singbox", Description: "neko233 自研 NekoTLS（AnyTLS 外层 + ECH/Reality 伪装）；sing-box 以原生 anytls 入站直接落地", Default: true, DefaultNoDomain: true, DefaultDomain: true, NeedsDomain: false, NeedsTLS: true, SupportsReality: true, SupportsECH: true, SecurityLevel: "high", RecommendedWhen: "旗舰默认：域名走 ECH，免域名走 Reality", Extensible: true, SubscribeTarget: "clash-meta-nekotls"},
+	{ID: "singbox-vmess", Name: "VMess-TCP", Core: "singbox", Description: "标准 VMess TCP 入站", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "兼容旧客户端", Extensible: true},
+	{ID: "singbox-vmess-ws", Name: "VMess-WS", Core: "singbox", Description: "WS + TLS 入站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "WS 兼容场景", Extensible: true},
+	{ID: "singbox-trojan", Name: "Trojan", Core: "singbox", Description: "Trojan TLS 入站模板", Default: true, DefaultNoDomain: false, DefaultDomain: true, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "high-with-real-cert", RecommendedWhen: "域名兼容补位", Extensible: true},
+	{ID: "singbox-trojan-grpc", Name: "Trojan-gRPC", Core: "singbox", Description: "Trojan + gRPC 入站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "high-with-real-cert", RecommendedWhen: "Trojan + gRPC", Extensible: true},
+	{ID: "singbox-shadowsocks", Name: "Shadowsocks", Core: "singbox", Description: "Shadowsocks 2022 直出模板", Default: true, DefaultNoDomain: false, DefaultDomain: true, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "备用协议", Extensible: true},
+	{ID: "singbox-hysteria2", Name: "Hysteria2", Core: "singbox", Description: "QUIC/Hysteria2 自签证书模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "高延迟链路", Extensible: true},
+	{ID: "singbox-tuic", Name: "TUIC", Core: "singbox", Description: "TUIC + BBR 模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "UDP 优先", Extensible: true},
+	{ID: "singbox-wireguard", Name: "WireGuard", Core: "singbox", Description: "WireGuard 服务端模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "high", RecommendedWhen: "原生隧道", Extensible: true},
+	{ID: "singbox-socks", Name: "SOCKS5", Core: "singbox", Description: "带密码的 SOCKS5 入站", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "low", RecommendedWhen: "内网调试", Extensible: true},
+	{ID: "singbox-http", Name: "HTTP", Core: "singbox", Description: "带密码的 HTTP CONNECT 入站", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "low", RecommendedWhen: "兼容调试", Extensible: true},
+	{ID: "mihomo-vless", Name: "Mihomo-VLESS", Core: "mihomo", Description: "VLESS TCP 出站管理模板", Default: true, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "兼容优先", Extensible: true},
+	{ID: "mihomo-vless-grpc", Name: "Mihomo-VLESS-gRPC", Core: "mihomo", Description: "VLESS gRPC 出站模板", Default: true, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "需要 gRPC", Extensible: true},
+	{ID: "mihomo-vless-reality-grpc", Name: "Mihomo-VLESS-Reality-gRPC", Core: "mihomo", Description: "Reality + gRPC 出站模板", Default: true, DefaultNoDomain: true, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: true, SupportsECH: false, SecurityLevel: "high", RecommendedWhen: "无域名默认", Extensible: true},
+	{ID: "mihomo-anytls", Name: "Mihomo-AnyTLS", Core: "mihomo", Description: "AnyTLS 出站模板，支持 ECH，域名模式推荐", Default: false, DefaultNoDomain: false, DefaultDomain: true, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: true, SecurityLevel: "high-with-real-cert", RecommendedWhen: "有域名默认", Extensible: true},
+	{ID: "mihomo-nekotls", Name: "Mihomo-NekoTLS", Core: "mihomo", Description: "NekoTLS 原生出站（需 mihomo fork，type: nekotls）：统一 uTLS 指纹 + ECH + Reality", Default: true, DefaultNoDomain: true, DefaultDomain: true, NeedsDomain: false, NeedsTLS: true, SupportsReality: true, SupportsECH: true, SecurityLevel: "high", RecommendedWhen: "旗舰默认（Clash/mihomo 原生）", Extensible: true, SubscribeTarget: "clash-meta-nekotls"},
+	{ID: "mihomo-vmess", Name: "Mihomo-VMess", Core: "mihomo", Description: "VMess TCP 出站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "兼容旧客户端", Extensible: true},
+	{ID: "mihomo-vmess-ws", Name: "Mihomo-VMess-WS", Core: "mihomo", Description: "VMess WS 出站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "WS 兼容场景", Extensible: true},
+	{ID: "mihomo-trojan", Name: "Mihomo-Trojan", Core: "mihomo", Description: "Trojan TLS 出站模板", Default: true, DefaultNoDomain: false, DefaultDomain: true, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "high-with-real-cert", RecommendedWhen: "域名兼容补位", Extensible: true},
+	{ID: "mihomo-trojan-grpc", Name: "Mihomo-Trojan-gRPC", Core: "mihomo", Description: "Trojan gRPC 出站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "high-with-real-cert", RecommendedWhen: "Trojan + gRPC", Extensible: true},
+	{ID: "mihomo-shadowsocks", Name: "Mihomo-Shadowsocks", Core: "mihomo", Description: "Shadowsocks 2022 出站模板", Default: true, DefaultNoDomain: false, DefaultDomain: true, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "备用协议", Extensible: true},
+	{ID: "mihomo-hysteria2", Name: "Mihomo-Hysteria2", Core: "mihomo", Description: "Hysteria2 出站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "高延迟链路", Extensible: true},
+	{ID: "mihomo-tuic", Name: "Mihomo-TUIC", Core: "mihomo", Description: "TUIC 出站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: true, SupportsReality: false, SupportsECH: false, SecurityLevel: "medium", RecommendedWhen: "UDP 优先", Extensible: true},
+	{ID: "mihomo-wireguard", Name: "Mihomo-WireGuard", Core: "mihomo", Description: "WireGuard 出站模板", Default: false, DefaultNoDomain: false, DefaultDomain: false, NeedsDomain: false, NeedsTLS: false, SupportsReality: false, SupportsECH: false, SecurityLevel: "high", RecommendedWhen: "原生隧道", Extensible: true},
 }
 
 func main() {
@@ -299,15 +350,15 @@ func newAppState() (*AppState, error) {
 		return nil, err
 	}
 	state.cfg = normalizeRepoDefaults(state.cfg)
-	if result, ctx, err := ensureSubscribeRepoSync(state.cfg); err != nil {
-		log.Printf("subscribe repository check failed: %s status=%s error=%s", result.Status, result.Error, err)
-	} else {
-		log.Printf("subscribe repository status=%s action=%s git_root=%v submodule=%v", result.Status, result.Action, ctx.IsRootRepository, ctx.IsSubmodule)
-	}
 	return state, nil
 }
 
 func runServer(state *AppState) error {
+	if result, ctx, err := ensureSubscribeRepoSync(state.snapshotConfig()); err != nil {
+		log.Printf("subscribe repository check failed: %s status=%s error=%s", result.Status, result.Error, err)
+	} else {
+		log.Printf("subscribe repository status=%s action=%s git_root=%v submodule=%v", result.Status, result.Action, ctx.IsRootRepository, ctx.IsSubmodule)
+	}
 	cfg := state.snapshotConfig()
 	addr := fmt.Sprintf("%s:%d", cfg.ListenAddr, cfg.ListenPort)
 	log.Printf("vpn233-agent listening on %s", addr)
@@ -327,6 +378,7 @@ func buildMux(state *AppState) *http.ServeMux {
 	mux.HandleFunc("/api/v1/repo/status", state.auth(state.repoStatusHandler))
 	mux.HandleFunc("/api/v1/repo/sync", state.auth(state.repoSyncHandler))
 	mux.HandleFunc("/api/v1/subscribe/verify", state.subscribeVerifyHandler)
+	mux.HandleFunc("/api/v1/subscribe/convert", state.subscribeConvertHandler)
 
 	mux.HandleFunc("/api/v1/local/health", state.localOnly(state.healthHandler))
 	mux.HandleFunc("/api/v1/local/protocols", state.localOnly(state.protocolListHandler))
@@ -336,6 +388,7 @@ func buildMux(state *AppState) *http.ServeMux {
 	mux.HandleFunc("/api/v1/local/generate.ps1", state.localOnly(state.generateAliasHandler("ps1")))
 	mux.HandleFunc("/api/v1/local/repo/status", state.localOnly(state.repoStatusHandler))
 	mux.HandleFunc("/api/v1/local/repo/sync", state.localOnly(state.repoSyncHandler))
+	mux.HandleFunc("/api/v1/local/subscribe/convert", state.localOnly(state.subscribeConvertHandler))
 	return mux
 }
 
@@ -474,13 +527,31 @@ func runCLIGenerate(state *AppState, stdout io.Writer, args []string) error {
 	password := fs.String("password", "", "custom password")
 	protocols := fs.String("protocols", "", "comma separated protocol ids")
 	portBase := fs.Int("port-base", 0, "base port")
+	acmeDomain := fs.String("acme-domain", "", "ACME certificate domain")
+	acmeEmail := fs.String("acme-email", "", "ACME registration email")
+	tcpCongestion := fs.String("tcp-congestion", "", "TCP congestion control (bbr|cubic|...)")
+	connLimit := fs.Int("conn-limit", 0, "open file/connection limit (nofile)")
 
 	var useMihomo optionalBool
 	var useSingbox optionalBool
 	var enableBBR optionalBool
+	var enableTCPFastOpen optionalBool
+	var enableMPTCP optionalBool
+	var enableHardening optionalBool
+	var enableFail2ban optionalBool
+	var enableLogRotate optionalBool
+	var enableWatchdog optionalBool
+	var enableACME optionalBool
 	fs.Var(&useMihomo, "use-mihomo", "enable Mihomo outputs")
 	fs.Var(&useSingbox, "use-singbox", "enable sing-box outputs")
 	fs.Var(&enableBBR, "enable-bbr", "enable BBR optimization")
+	fs.Var(&enableTCPFastOpen, "enable-tcp-fastopen", "enable TCP Fast Open")
+	fs.Var(&enableMPTCP, "enable-mptcp", "enable Multipath TCP")
+	fs.Var(&enableHardening, "enable-hardening", "enable kernel/security hardening")
+	fs.Var(&enableFail2ban, "enable-fail2ban", "install fail2ban SSH protection")
+	fs.Var(&enableLogRotate, "enable-logrotate", "install logrotate rules")
+	fs.Var(&enableWatchdog, "enable-watchdog", "install self-healing watchdog")
+	fs.Var(&enableACME, "enable-acme", "issue a real ACME certificate")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -520,6 +591,46 @@ func runCLIGenerate(state *AppState, stdout io.Writer, args []string) error {
 	}
 	if enableBBR.set {
 		req.EnableBBR = boolPtrValue(enableBBR.value)
+	}
+	if enableTCPFastOpen.set {
+		req.EnableTCPFastOpen = boolPtrValue(enableTCPFastOpen.value)
+	}
+	if enableMPTCP.set {
+		req.EnableMPTCP = boolPtrValue(enableMPTCP.value)
+	}
+	if enableHardening.set {
+		req.EnableHardening = boolPtrValue(enableHardening.value)
+	}
+	if enableFail2ban.set {
+		req.EnableFail2ban = boolPtrValue(enableFail2ban.value)
+	}
+	if enableLogRotate.set {
+		req.EnableLogRotate = boolPtrValue(enableLogRotate.value)
+	}
+	if enableWatchdog.set {
+		req.EnableWatchdog = boolPtrValue(enableWatchdog.value)
+	}
+	if enableACME.set {
+		req.EnableACME = boolPtrValue(enableACME.value)
+	}
+	if *acmeDomain != "" {
+		req.ACMEDomain = *acmeDomain
+	}
+	if *acmeEmail != "" {
+		req.ACMEEmail = *acmeEmail
+	}
+	if *tcpCongestion != "" {
+		req.TCPCongestion = *tcpCongestion
+	}
+	if *connLimit > 0 {
+		req.ConnLimit = *connLimit
+	}
+	if len(req.SelectedProtocols) == 0 {
+		req.SelectedProtocols = defaultProtocolIDsForStrategy(
+			endpointStrategy(req.NodeIP),
+			resolveEnabled(req.UseSingbox, state.snapshotConfig().DefaultUseSingbox),
+			resolveEnabled(req.UseMihomo, state.snapshotConfig().DefaultUseMihomo),
+		)
 	}
 
 	result, err := state.generateArtifacts(req)
@@ -796,10 +907,67 @@ func (a *AppState) snapshotConfig() ServerConfig {
 	return a.cfg
 }
 
-func (a *AppState) protocolListHandler(w http.ResponseWriter, r *http.Request) {
+func endpointStrategy(raw string) string {
+	host := strings.TrimSpace(raw)
+	if host == "" || strings.EqualFold(host, "auto") {
+		return "no_domain"
+	}
+	if ip := net.ParseIP(strings.Trim(host, "[]")); ip != nil {
+		return "no_domain"
+	}
+	if strings.Contains(host, ".") {
+		return "domain"
+	}
+	return "no_domain"
+}
+
+func protocolCatalogForStrategy(strategy string) []ProtocolCatalog {
 	out := make([]ProtocolCatalog, len(protocolCatalog))
 	copy(out, protocolCatalog)
-	sort.Slice(out, func(i, j int) bool { return out[i].Core < out[j].Core || (out[i].Core == out[j].Core && out[i].ID < out[j].ID) })
+	for i := range out {
+		switch strategy {
+		case "domain":
+			out[i].Default = out[i].DefaultDomain
+		default:
+			out[i].Default = out[i].DefaultNoDomain
+		}
+	}
+	return out
+}
+
+func resolveEnabled(flag *bool, fallback bool) bool {
+	if flag != nil {
+		return *flag
+	}
+	return fallback
+}
+
+func defaultProtocolIDsForStrategy(strategy string, useSingbox, useMihomo bool) []string {
+	out := make([]string, 0)
+	for _, item := range protocolCatalogForStrategy(strategy) {
+		if !item.Default {
+			continue
+		}
+		if item.Core == "singbox" && !useSingbox {
+			continue
+		}
+		if item.Core == "mihomo" && !useMihomo {
+			continue
+		}
+		out = append(out, item.ID)
+	}
+	return out
+}
+
+func (a *AppState) protocolListHandler(w http.ResponseWriter, r *http.Request) {
+	nodeIP := strings.TrimSpace(r.URL.Query().Get("node_ip"))
+	if nodeIP == "" {
+		nodeIP = strings.TrimSpace(r.URL.Query().Get("host"))
+	}
+	out := protocolCatalogForStrategy(endpointStrategy(nodeIP))
+	sort.Slice(out, func(i, j int) bool {
+		return out[i].Core < out[j].Core || (out[i].Core == out[j].Core && out[i].ID < out[j].ID)
+	})
 	writeJSON(w, http.StatusOK, out)
 }
 
@@ -809,20 +977,20 @@ func (a *AppState) configHandler(w http.ResponseWriter, r *http.Request) {
 		a.mu.RLock()
 		defer a.mu.RUnlock()
 		response := map[string]any{
-			"node_name_default": "vpn233-node",
-			"listen_addr":        a.cfg.ListenAddr,
-			"listen_port":        a.cfg.ListenPort,
-			"admin_user":         a.cfg.AdminUser,
-			"subscribe_repo_url":  a.cfg.SubscribeRepoURL,
-			"subscribe_repo_path": a.cfg.SubscribeRepoPath,
-			"subscribe_repo_branch": a.cfg.SubscribeRepoBranch,
+			"node_name_default":      "vpn233-node",
+			"listen_addr":            a.cfg.ListenAddr,
+			"listen_port":            a.cfg.ListenPort,
+			"admin_user":             a.cfg.AdminUser,
+			"subscribe_repo_url":     a.cfg.SubscribeRepoURL,
+			"subscribe_repo_path":    a.cfg.SubscribeRepoPath,
+			"subscribe_repo_branch":  a.cfg.SubscribeRepoBranch,
 			"subscribe_verify_token": a.cfg.SubscribeVerifyToken,
-			"default_data_dir":    a.cfg.DefaultDataDir,
-			"default_node_ip":     a.cfg.DefaultNodeIP,
-			"default_port_base":   a.cfg.DefaultPortBase,
-			"default_enable_bbr":  a.cfg.DefaultEnableBBR,
-			"default_use_mihomo":  a.cfg.DefaultUseMihomo,
-			"default_use_singbox": a.cfg.DefaultUseSingbox,
+			"default_data_dir":       a.cfg.DefaultDataDir,
+			"default_node_ip":        a.cfg.DefaultNodeIP,
+			"default_port_base":      a.cfg.DefaultPortBase,
+			"default_enable_bbr":     a.cfg.DefaultEnableBBR,
+			"default_use_mihomo":     a.cfg.DefaultUseMihomo,
+			"default_use_singbox":    a.cfg.DefaultUseSingbox,
 		}
 		writeJSON(w, http.StatusOK, response)
 	case http.MethodPost:
@@ -949,7 +1117,7 @@ func (a *AppState) repoStatusHandler(w http.ResponseWriter, r *http.Request) {
 	ctx, err := inspectGitContext(".")
 	if err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
-			"error": "inspect git context failed",
+			"error":  "inspect git context failed",
 			"detail": err.Error(),
 		})
 		return
@@ -1006,24 +1174,25 @@ func (a *AppState) subscribeVerifyHandler(w http.ResponseWriter, r *http.Request
 	result, _, syncErr := ensureSubscribeRepoSync(cfg)
 	if syncErr != nil && !ctx.IsSubmodule {
 		writeJSON(w, http.StatusBadRequest, map[string]any{
-			"ok":         false,
-			"error":      syncErr.Error(),
-			"repo_state": result,
+			"ok":          false,
+			"error":       syncErr.Error(),
+			"repo_state":  result,
 			"git_context": ctx,
 		})
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":        true,
-		"service":   "vpn233-provider-server",
-		"version":   "1.0.0",
-		"git_root":  ctx.TopLevel,
-		"protocols": protocolCatalog,
+		"ok":                true,
+		"service":           "vpn233-provider-server",
+		"version":           "1.1.0",
+		"git_root":          ctx.TopLevel,
+		"protocols":         protocolCatalog,
+		"subscribe_targets": subscribeTargets(),
 		"repo_state": map[string]any{
-			"path":      result.RepoPath,
-			"url":       result.RepoURL,
-			"branch":    result.Branch,
-			"status":    result.Status,
+			"path":   result.RepoPath,
+			"url":    result.RepoURL,
+			"branch": result.Branch,
+			"status": result.Status,
 		},
 	})
 }
@@ -1032,6 +1201,13 @@ func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error)
 	a.mu.RLock()
 	cfg := a.cfg
 	a.mu.RUnlock()
+	if len(req.SelectedProtocols) == 0 {
+		req.SelectedProtocols = defaultProtocolIDsForStrategy(
+			endpointStrategy(req.NodeIP),
+			resolveEnabled(req.UseSingbox, cfg.DefaultUseSingbox),
+			resolveEnabled(req.UseMihomo, cfg.DefaultUseMihomo),
+		)
+	}
 
 	profile, err := normalizeRequest(req, cfg)
 	if err != nil {
@@ -1055,10 +1231,10 @@ func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error)
 			nextPort += 11
 		}
 		mapping = append(mapping, ProtocolPort{
-			ID:      p.ID,
-			Name:    p.Name,
-			Core:    p.Core,
-			Port:    port,
+			ID:   p.ID,
+			Name: p.Name,
+			Core: p.Core,
+			Port: port,
 		})
 	}
 	profile.PortMap = mapping
@@ -1073,32 +1249,43 @@ func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error)
 	}
 
 	shellCtx := map[string]any{
-		"NodeName":       profile.NodeName,
-		"NodeIP":         profile.NodeIP,
-		"ServerName":     profile.ServerName,
-		"RealityServer":  profile.RealityServer,
-		"DataDir":        profile.DataDir,
-		"UseMihomo":      profile.UseMihomo,
-		"UseSingbox":     profile.UseSingbox,
-		"EnableBBR":      profile.EnableBBR,
-		"PortBase":       profile.PortBase,
-		"UUID":           profile.UUID,
-		"Password":       profile.Password,
-		"GRPCServiceName": profile.GRPCServiceName,
-		"RealityPublicKey": profile.RealityPublicKey,
-		"RealityShortID": profile.RealityShortID,
+		"NodeName":                  profile.NodeName,
+		"NodeIP":                    profile.NodeIP,
+		"ServerName":                profile.ServerName,
+		"RealityServer":             profile.RealityServer,
+		"DataDir":                   profile.DataDir,
+		"UseMihomo":                 profile.UseMihomo,
+		"UseSingbox":                profile.UseSingbox,
+		"EnableBBR":                 profile.EnableBBR,
+		"EnableTCPFastOpen":         profile.EnableTCPFastOpen,
+		"EnableMPTCP":               profile.EnableMPTCP,
+		"EnableHardening":           profile.EnableHardening,
+		"EnableFail2ban":            profile.EnableFail2ban,
+		"EnableLogRotate":           profile.EnableLogRotate,
+		"EnableWatchdog":            profile.EnableWatchdog,
+		"EnableACME":                profile.EnableACME,
+		"ACMEDomain":                profile.ACMEDomain,
+		"ACMEEmail":                 profile.ACMEEmail,
+		"TCPCongestion":             profile.TCPCongestion,
+		"ConnLimit":                 profile.ConnLimit,
+		"PortBase":                  profile.PortBase,
+		"UUID":                      profile.UUID,
+		"Password":                  profile.Password,
+		"GRPCServiceName":           profile.GRPCServiceName,
+		"RealityPublicKey":          profile.RealityPublicKey,
+		"RealityShortID":            profile.RealityShortID,
 		"WireGuardClientPrivateKey": profile.WireGuardClientPrivateKey,
-		"WireGuardServerPublicKey": profile.WireGuardServerPublicKey,
-		"WireGuardPresharedKey": profile.WireGuardPresharedKey,
-		"WireGuardClientCIDR": profile.WireGuardClientCIDR,
-		"Ports":          mapping,
-		"PortsCSV":       buildPortsCSV(mapping),
-		"PortsJSON":      buildPortsJSON(mapping),
-		"SingBoxConfig":  singCfg,
-		"MihomoConfig":   mihomoCfg,
-		"TLSCertPEM":     profile.TLSCertPEM,
-		"TLSKeyPEM":      profile.TLSKeyPEM,
-		"GeneratedAt":    time.Now().Format(time.RFC3339),
+		"WireGuardServerPublicKey":  profile.WireGuardServerPublicKey,
+		"WireGuardPresharedKey":     profile.WireGuardPresharedKey,
+		"WireGuardClientCIDR":       profile.WireGuardClientCIDR,
+		"Ports":                     mapping,
+		"PortsCSV":                  buildPortsCSV(mapping),
+		"PortsJSON":                 buildPortsJSON(mapping),
+		"SingBoxConfig":             singCfg,
+		"MihomoConfig":              mihomoCfg,
+		"TLSCertPEM":                profile.TLSCertPEM,
+		"TLSKeyPEM":                 profile.TLSKeyPEM,
+		"GeneratedAt":               time.Now().Format(time.RFC3339),
 	}
 
 	sh, err := renderTemplate(shellInstallTemplate, shellCtx)
@@ -1106,29 +1293,32 @@ func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error)
 		return generateResult{}, err
 	}
 	ps1, err := renderTemplate(ps1InstallTemplate, map[string]any{
-		"NodeName":       profile.NodeName,
-		"NodeIP":         profile.NodeIP,
-		"ServerName":     profile.ServerName,
-		"RealityServer":  profile.RealityServer,
-		"DataDir":        profile.DataDir,
-		"UseMihomo":      profile.UseMihomo,
-		"UseSingbox":     profile.UseSingbox,
-		"EnableBBR":      profile.EnableBBR,
-		"GRPCServiceName": profile.GRPCServiceName,
-		"RealityPublicKey": profile.RealityPublicKey,
-		"RealityShortID": profile.RealityShortID,
+		"NodeName":                  profile.NodeName,
+		"NodeIP":                    profile.NodeIP,
+		"ServerName":                profile.ServerName,
+		"RealityServer":             profile.RealityServer,
+		"DataDir":                   profile.DataDir,
+		"UseMihomo":                 profile.UseMihomo,
+		"UseSingbox":                profile.UseSingbox,
+		"EnableBBR":                 profile.EnableBBR,
+		"EnableTCPFastOpen":         profile.EnableTCPFastOpen,
+		"EnableHardening":           profile.EnableHardening,
+		"ConnLimit":                 profile.ConnLimit,
+		"GRPCServiceName":           profile.GRPCServiceName,
+		"RealityPublicKey":          profile.RealityPublicKey,
+		"RealityShortID":            profile.RealityShortID,
 		"WireGuardClientPrivateKey": profile.WireGuardClientPrivateKey,
-		"WireGuardServerPublicKey": profile.WireGuardServerPublicKey,
-		"WireGuardPresharedKey": profile.WireGuardPresharedKey,
-		"WireGuardClientCIDR": profile.WireGuardClientCIDR,
-		"PortsCSV":       buildPortsCSV(mapping),
-		"PortsJSON":      buildPortsJSON(mapping),
-		"Password":       profile.Password,
-		"SingBoxConfig":  singCfg,
-		"MihomoConfig":   mihomoCfg,
-		"TLSCertPEM":     profile.TLSCertPEM,
-		"TLSKeyPEM":      profile.TLSKeyPEM,
-		"GeneratedAt":    time.Now().Format(time.RFC3339),
+		"WireGuardServerPublicKey":  profile.WireGuardServerPublicKey,
+		"WireGuardPresharedKey":     profile.WireGuardPresharedKey,
+		"WireGuardClientCIDR":       profile.WireGuardClientCIDR,
+		"PortsCSV":                  buildPortsCSV(mapping),
+		"PortsJSON":                 buildPortsJSON(mapping),
+		"Password":                  profile.Password,
+		"SingBoxConfig":             singCfg,
+		"MihomoConfig":              mihomoCfg,
+		"TLSCertPEM":                profile.TLSCertPEM,
+		"TLSKeyPEM":                 profile.TLSKeyPEM,
+		"GeneratedAt":               time.Now().Format(time.RFC3339),
 	})
 	if err != nil {
 		return generateResult{}, err
@@ -1145,6 +1335,8 @@ func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error)
 	result.Node.GRPCServiceName = profile.GRPCServiceName
 	result.Node.RealityPublicKey = profile.RealityPublicKey
 	result.Node.RealityShortID = profile.RealityShortID
+	result.Node.NekoTLSPublicName = profile.NekoTLSPublicName
+	result.Node.NekoTLSECHConfig = profile.NekoTLSECHConfig
 	result.Node.WireGuardClientKey = profile.WireGuardClientPrivateKey
 	result.Node.WireGuardPresharedKey = profile.WireGuardPresharedKey
 	result.Node.WireGuardClientCIDR = profile.WireGuardClientCIDR
@@ -1152,28 +1344,30 @@ func (a *AppState) generateArtifacts(req InstallRequest) (generateResult, error)
 	result.Node.SingBoxDir = filepath.Join(profile.DataDir, "singbox")
 	result.Node.Ports = mapping
 	result.Node.Links = buildConnectionLinks(profile, mapping)
+	result.profile = profile
+	result.mapping = mapping
 	return result, nil
 }
 
 type normalizedRequest struct {
-	NodeName          string
-	NodeIP            string
-	ServerName        string
-	DataDir           string
-	UseMihomo         bool
-	UseSingbox        bool
-	EnableBBR         bool
-	PortBase          int
-	AdminPassword     string
-	UUID              string
-	Password          string
-	GRPCServiceName   string
-	RealityPrivateKey string
-	RealityPublicKey  string
-	RealityShortID    string
-	RealityServer     string
-	TLSCertPEM        string
-	TLSKeyPEM         string
+	NodeName                  string
+	NodeIP                    string
+	ServerName                string
+	DataDir                   string
+	UseMihomo                 bool
+	UseSingbox                bool
+	EnableBBR                 bool
+	PortBase                  int
+	AdminPassword             string
+	UUID                      string
+	Password                  string
+	GRPCServiceName           string
+	RealityPrivateKey         string
+	RealityPublicKey          string
+	RealityShortID            string
+	RealityServer             string
+	TLSCertPEM                string
+	TLSKeyPEM                 string
 	WireGuardServerPrivateKey string
 	WireGuardServerPublicKey  string
 	WireGuardClientPrivateKey string
@@ -1181,23 +1375,44 @@ type normalizedRequest struct {
 	WireGuardPresharedKey     string
 	WireGuardServerCIDR       string
 	WireGuardClientCIDR       string
-	SelectedProtocols []string
-	PortMap           []ProtocolPort
+	NekoTLSPublicName         string
+	NekoTLSECHConfig          string
+	EnableTCPFastOpen         bool
+	EnableMPTCP               bool
+	EnableHardening           bool
+	EnableFail2ban            bool
+	EnableLogRotate           bool
+	EnableWatchdog            bool
+	EnableACME                bool
+	ACMEDomain                string
+	ACMEEmail                 string
+	TCPCongestion             string
+	ConnLimit                 int
+	SelectedProtocols         []string
+	PortMap                   []ProtocolPort
 }
 
 func normalizeRequest(req InstallRequest, cfg ServerConfig) (normalizedRequest, error) {
 	out := normalizedRequest{
-		NodeName:   "vpn233-node",
-		NodeIP:     cfg.DefaultNodeIP,
-		DataDir:    strings.TrimSpace(cfg.DefaultDataDir),
-		PortBase:   cfg.DefaultPortBase,
-		EnableBBR:  cfg.DefaultEnableBBR,
-		UseMihomo:  cfg.DefaultUseMihomo,
-		UseSingbox: cfg.DefaultUseSingbox,
-		GRPCServiceName: "vpn233-grpc",
-		RealityServer:   "www.cloudflare.com",
+		NodeName:            "vpn233-node",
+		NodeIP:              cfg.DefaultNodeIP,
+		DataDir:             strings.TrimSpace(cfg.DefaultDataDir),
+		PortBase:            cfg.DefaultPortBase,
+		EnableBBR:           cfg.DefaultEnableBBR,
+		UseMihomo:           cfg.DefaultUseMihomo,
+		UseSingbox:          cfg.DefaultUseSingbox,
+		GRPCServiceName:     "vpn233-grpc",
+		RealityServer:       "www.cloudflare.com",
 		WireGuardServerCIDR: "172.19.0.1/30",
 		WireGuardClientCIDR: "172.19.0.2/32",
+		EnableTCPFastOpen:   true,
+		EnableHardening:     true,
+		EnableFail2ban:      true,
+		EnableLogRotate:     true,
+		EnableWatchdog:      true,
+		EnableMPTCP:         false,
+		TCPCongestion:       "bbr",
+		ConnLimit:           1048576,
 	}
 	if req.NodeName != "" {
 		out.NodeName = req.NodeName
@@ -1219,6 +1434,37 @@ func normalizeRequest(req InstallRequest, cfg ServerConfig) (normalizedRequest, 
 	}
 	if req.EnableBBR != nil {
 		out.EnableBBR = *req.EnableBBR
+	}
+	if req.EnableTCPFastOpen != nil {
+		out.EnableTCPFastOpen = *req.EnableTCPFastOpen
+	}
+	if req.EnableMPTCP != nil {
+		out.EnableMPTCP = *req.EnableMPTCP
+	}
+	if req.EnableHardening != nil {
+		out.EnableHardening = *req.EnableHardening
+	}
+	if req.EnableFail2ban != nil {
+		out.EnableFail2ban = *req.EnableFail2ban
+	}
+	if req.EnableLogRotate != nil {
+		out.EnableLogRotate = *req.EnableLogRotate
+	}
+	if req.EnableWatchdog != nil {
+		out.EnableWatchdog = *req.EnableWatchdog
+	}
+	if strings.TrimSpace(req.TCPCongestion) != "" {
+		out.TCPCongestion = strings.ToLower(strings.TrimSpace(req.TCPCongestion))
+	}
+	if req.ConnLimit > 0 {
+		out.ConnLimit = req.ConnLimit
+	}
+	out.ACMEDomain = strings.TrimSpace(req.ACMEDomain)
+	out.ACMEEmail = strings.TrimSpace(req.ACMEEmail)
+	if req.EnableACME != nil {
+		out.EnableACME = *req.EnableACME
+	} else {
+		out.EnableACME = out.ACMEDomain != "" && endpointStrategy(out.NodeIP) == "domain"
 	}
 	out.AdminPassword = req.AdminPassword
 	if req.AdminPassword != "" {
@@ -1258,6 +1504,16 @@ func normalizeRequest(req InstallRequest, cfg ServerConfig) (normalizedRequest, 
 	out.WireGuardClientPrivateKey = wgClientPrivate
 	out.WireGuardClientPublicKey = wgClientPublic
 	out.WireGuardPresharedKey = wgPSK
+	if endpointStrategy(out.NodeIP) == "domain" {
+		out.NekoTLSPublicName = out.ServerName
+	} else {
+		out.NekoTLSPublicName = out.RealityServer
+	}
+	echConfig, err := generateNekoTLSECHConfig(out.NekoTLSPublicName)
+	if err != nil {
+		return normalizedRequest{}, err
+	}
+	out.NekoTLSECHConfig = echConfig
 	return out, nil
 }
 
@@ -1335,6 +1591,10 @@ func mihomoToSingboxPair(id string) (string, bool) {
 		return "singbox-vless-grpc", true
 	case "mihomo-vless-reality-grpc":
 		return "singbox-vless-reality-grpc", true
+	case "mihomo-anytls":
+		return "singbox-anytls", true
+	case "mihomo-nekotls":
+		return "singbox-nekotls", true
 	case "mihomo-vmess":
 		return "singbox-vmess", true
 	case "mihomo-vmess-ws":
@@ -1402,6 +1662,10 @@ func connectionLinkForProtocol(req normalizedRequest, p ProtocolPort) string {
 		return fmt.Sprintf("vless://%s@%s:%d?security=reality&sni=%s&pbk=%s&sid=%s&type=tcp#%s", req.UUID, req.NodeIP, p.Port, req.RealityServer, req.RealityPublicKey, req.RealityShortID, p.Name)
 	case "singbox-vless-reality-grpc":
 		return fmt.Sprintf("vless://%s@%s:%d?security=reality&sni=%s&pbk=%s&sid=%s&type=grpc&serviceName=%s#%s", req.UUID, req.NodeIP, p.Port, req.RealityServer, req.RealityPublicKey, req.RealityShortID, req.GRPCServiceName, p.Name)
+	case "singbox-anytls":
+		return fmt.Sprintf("anytls://%s@%s:%d/?sni=%s&insecure=1#%s", req.Password, req.NodeIP, p.Port, req.ServerName, p.Name)
+	case "singbox-nekotls":
+		return nekotlsLink(req, p)
 	case "singbox-vmess":
 		return vmessLink(req.NodeIP, p.Port, req.UUID, "", "", false)
 	case "singbox-vmess-ws":
@@ -1430,19 +1694,19 @@ func connectionLinkForProtocol(req normalizedRequest, p ProtocolPort) string {
 
 func vmessLink(host string, port int, uuid, pathValue, serverName string, tlsEnabled bool) string {
 	payload := map[string]string{
-		"v":   "2",
-		"ps":  "VMess",
-		"add": host,
+		"v":    "2",
+		"ps":   "VMess",
+		"add":  host,
 		"port": strconv.Itoa(port),
-		"id":  uuid,
-		"aid": "0",
-		"scy": "auto",
-		"net": "tcp",
+		"id":   uuid,
+		"aid":  "0",
+		"scy":  "auto",
+		"net":  "tcp",
 		"type": "none",
 		"host": "",
 		"path": "",
-		"tls": "",
-		"sni": "",
+		"tls":  "",
+		"sni":  "",
 	}
 	if pathValue != "" {
 		payload["net"] = "ws"
@@ -1463,7 +1727,7 @@ func vmessLink(host string, port int, uuid, pathValue, serverName string, tlsEna
 func buildSingBoxConfig(req normalizedRequest, ports []ProtocolPort) (string, error) {
 	cfg := map[string]any{
 		"log": map[string]any{
-			"level": "info",
+			"level":     "info",
 			"timestamp": true,
 		},
 		"dns": map[string]any{
@@ -1491,7 +1755,7 @@ func buildSingBoxConfig(req normalizedRequest, ports []ProtocolPort) (string, er
 		},
 		"route": map[string]any{
 			"auto_detect_interface": true,
-			"final": "direct",
+			"final":                 "direct",
 			"rules": []any{
 				map[string]any{"protocol": "dns", "outbound": "dns-out"},
 				map[string]any{"network": "udp", "port": 53, "outbound": "dns-out"},
@@ -1541,6 +1805,23 @@ func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, erro
 		inbound["tls"] = singBoxRealityConfig(req, []string{"h2", "http/1.1"})
 		inbound["transport"] = grpcTransport(req)
 		return inbound, nil
+	case "singbox-anytls":
+		return map[string]any{
+			"type":        "anytls",
+			"tag":         "anytls-" + fmt.Sprintf("%d", p.Port),
+			"listen":      "::",
+			"listen_port": p.Port,
+			"users": []any{
+				map[string]any{
+					"name":     "vpn233",
+					"password": req.Password,
+				},
+			},
+			"padding_scheme": []string{},
+			"tls":            singBoxTLSConfig(req, []string{"h2", "http/1.1"}),
+		}, nil
+	case "singbox-nekotls":
+		return singBoxNekoTLSInbound(req, p), nil
 	case "singbox-vmess":
 		return map[string]any{
 			"type":        "vmess",
@@ -1549,7 +1830,7 @@ func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, erro
 			"listen_port": p.Port,
 			"users": []any{
 				map[string]any{
-					"uuid": req.UUID,
+					"uuid":    req.UUID,
 					"alterId": 0,
 				},
 			},
@@ -1563,7 +1844,7 @@ func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, erro
 			"listen_port": p.Port,
 			"users": []any{
 				map[string]any{
-					"uuid": req.UUID,
+					"uuid":    req.UUID,
 					"alterId": 0,
 				},
 			},
@@ -1578,7 +1859,7 @@ func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, erro
 			"listen_port": p.Port,
 			"users": []any{
 				map[string]any{
-					"name": "admin",
+					"name":     "admin",
 					"password": req.Password,
 				},
 			},
@@ -1592,7 +1873,7 @@ func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, erro
 			"listen_port": p.Port,
 			"users": []any{
 				map[string]any{
-					"name": "admin",
+					"name":     "admin",
 					"password": req.Password,
 				},
 			},
@@ -1635,16 +1916,16 @@ func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, erro
 			},
 			"congestion_control": "bbr",
 			"zero_rtt_handshake": false,
-			"tls": singBoxTLSConfig(req, []string{"h3"}),
+			"tls":                singBoxTLSConfig(req, []string{"h3"}),
 		}, nil
 	case "singbox-wireguard":
 		return map[string]any{
-			"type":         "wireguard",
-			"tag":          "wg-" + fmt.Sprintf("%d", p.Port),
-			"listen_port":  p.Port,
-			"address":      []string{req.WireGuardServerCIDR},
-			"private_key":  req.WireGuardServerPrivateKey,
-			"mtu":          1408,
+			"type":        "wireguard",
+			"tag":         "wg-" + fmt.Sprintf("%d", p.Port),
+			"listen_port": p.Port,
+			"address":     []string{req.WireGuardServerCIDR},
+			"private_key": req.WireGuardServerPrivateKey,
+			"mtu":         1408,
 			"peers": []any{
 				map[string]any{
 					"public_key":     req.WireGuardClientPublicKey,
@@ -1662,7 +1943,7 @@ func singBoxInbound(req normalizedRequest, p ProtocolPort) (map[string]any, erro
 			"users": []any{
 				map[string]any{"username": "vpn233", "password": req.Password},
 			},
-			"udp":         true,
+			"udp": true,
 		}, nil
 	case "singbox-http":
 		return map[string]any{
@@ -1733,9 +2014,9 @@ func singBoxRealityConfig(req normalizedRequest, alpn []string) map[string]any {
 
 func grpcTransport(req normalizedRequest) map[string]any {
 	return map[string]any{
-		"type":               "grpc",
-		"service_name":       req.GRPCServiceName,
-		"idle_timeout":       "15s",
+		"type":                  "grpc",
+		"service_name":          req.GRPCServiceName,
+		"idle_timeout":          "15s",
 		"permit_without_stream": false,
 	}
 }
@@ -1884,6 +2165,23 @@ func mihomoProxyLines(req normalizedRequest, p ProtocolPort, name string) ([]str
 			fmt.Sprintf("      public-key: %s", yamlQuote(req.RealityPublicKey)),
 			fmt.Sprintf("      short-id: %s", yamlQuote(req.RealityShortID)),
 		}, nil
+	case "mihomo-anytls":
+		return []string{
+			fmt.Sprintf("  - name: %s", yamlQuote(name)),
+			"    type: anytls",
+			fmt.Sprintf("    server: %s", server),
+			fmt.Sprintf("    port: %d", p.Port),
+			fmt.Sprintf("    password: %s", yamlQuote(req.Password)),
+			"    udp: true",
+			"    client-fingerprint: chrome",
+			"    idle-session-check-interval: 30",
+			"    idle-session-timeout: 30",
+			"    min-idle-session: 0",
+			fmt.Sprintf("    sni: %s", yamlQuote(req.ServerName)),
+			"    skip-cert-verify: true",
+		}, nil
+	case "mihomo-nekotls":
+		return renderNekoTLSYAMLLines(nekotlsProxyMap(req, p.Port, name)), nil
 	case "mihomo-vmess":
 		return []string{
 			fmt.Sprintf("  - name: %s", yamlQuote(name)),
@@ -2022,6 +2320,38 @@ func parseInstallRequestFromQuery(r *http.Request) (InstallRequest, error) {
 		return InstallRequest{}, fmt.Errorf("bad enable_bbr")
 	} else if ok {
 		req.EnableBBR = &v
+	}
+	boolFields := []struct {
+		key   string
+		field **bool
+	}{
+		{"enable_tcp_fastopen", &req.EnableTCPFastOpen},
+		{"enable_mptcp", &req.EnableMPTCP},
+		{"enable_hardening", &req.EnableHardening},
+		{"enable_fail2ban", &req.EnableFail2ban},
+		{"enable_logrotate", &req.EnableLogRotate},
+		{"enable_watchdog", &req.EnableWatchdog},
+		{"enable_acme", &req.EnableACME},
+	}
+	for _, bf := range boolFields {
+		v, ok, err := parseOptionalBoolQuery(q.Get(bf.key))
+		if err != nil {
+			return InstallRequest{}, fmt.Errorf("bad %s", bf.key)
+		}
+		if ok {
+			value := v
+			*bf.field = &value
+		}
+	}
+	req.ACMEDomain = strings.TrimSpace(q.Get("acme_domain"))
+	req.ACMEEmail = strings.TrimSpace(q.Get("acme_email"))
+	req.TCPCongestion = strings.TrimSpace(q.Get("tcp_congestion"))
+	if raw := strings.TrimSpace(q.Get("conn_limit")); raw != "" {
+		connLimit, err := strconv.Atoi(raw)
+		if err != nil {
+			return InstallRequest{}, fmt.Errorf("bad conn_limit")
+		}
+		req.ConnLimit = connLimit
 	}
 	rawProtocols := strings.TrimSpace(q.Get("selected_protocols"))
 	if rawProtocols == "" {
@@ -2232,6 +2562,17 @@ DATA_DIR="{{.DataDir}}"
 USE_MIHOMO="{{.UseMihomo}}"
 USE_SINGBOX="{{.UseSingbox}}"
 ENABLE_BBR="{{.EnableBBR}}"
+ENABLE_TCP_FASTOPEN="{{.EnableTCPFastOpen}}"
+ENABLE_MPTCP="{{.EnableMPTCP}}"
+ENABLE_HARDENING="{{.EnableHardening}}"
+ENABLE_FAIL2BAN="{{.EnableFail2ban}}"
+ENABLE_LOGROTATE="{{.EnableLogRotate}}"
+ENABLE_WATCHDOG="{{.EnableWatchdog}}"
+ENABLE_ACME="{{.EnableACME}}"
+ACME_DOMAIN="{{.ACMEDomain}}"
+ACME_EMAIL="{{.ACMEEmail}}"
+TCP_CONGESTION="{{.TCPCongestion}}"
+CONN_LIMIT="{{.ConnLimit}}"
 UUID="{{.UUID}}"
 PASSWORD="{{.Password}}"
 GRPC_SERVICE_NAME="{{.GRPCServiceName}}"
@@ -2295,26 +2636,220 @@ esac
 
 mkdir -p "$DATA_DIR/singbox" "$DATA_DIR/mihomo" "$DATA_DIR/tls" "/etc/systemd/system"
 
-install_bbr() {
+tune_performance() {
   if [[ "$ENABLE_BBR" != "true" ]]; then
+    echo "跳过内核性能优化 (ENABLE_BBR=false)"
     return
   fi
-  if [[ -f /etc/sysctl.d/99-vpn233-bbr.conf ]]; then
-    return
+  local cc="${TCP_CONGESTION:-bbr}"
+  if [[ "$cc" == "bbr" ]]; then
+    modprobe tcp_bbr 2>/dev/null || true
   fi
-  cat >/etc/sysctl.d/99-vpn233-bbr.conf <<'EOF'
+  local tfo=0
+  if [[ "$ENABLE_TCP_FASTOPEN" == "true" ]]; then
+    tfo=3
+  fi
+  cat >/etc/sysctl.d/99-vpn233.conf <<EOF
+# vpn233 performance tuning ($GENERATED_AT)
 net.core.default_qdisc=fq
-net.ipv4.tcp_congestion_control=bbr
-net.core.netdev_max_backlog=32768
+net.ipv4.tcp_congestion_control=${cc}
+net.core.netdev_max_backlog=250000
+net.core.netdev_budget=600
 net.core.rmem_max=134217728
 net.core.wmem_max=134217728
-net.ipv4.tcp_adv_win_scale=2
+net.core.rmem_default=1048576
+net.core.wmem_default=1048576
+net.core.optmem_max=65536
+net.core.somaxconn=65535
 net.ipv4.tcp_rmem=4096 87380 134217728
 net.ipv4.tcp_wmem=4096 65536 134217728
-net.core.somaxconn=32768
+net.ipv4.udp_rmem_min=8192
+net.ipv4.udp_wmem_min=8192
+net.ipv4.tcp_adv_win_scale=2
+net.ipv4.tcp_mtu_probing=1
+net.ipv4.tcp_slow_start_after_idle=0
+net.ipv4.tcp_fin_timeout=15
+net.ipv4.tcp_keepalive_time=600
+net.ipv4.tcp_keepalive_intvl=30
+net.ipv4.tcp_keepalive_probes=5
+net.ipv4.tcp_max_syn_backlog=65535
+net.ipv4.tcp_max_tw_buckets=2000000
+net.ipv4.tcp_tw_reuse=1
+net.ipv4.tcp_fastopen=${tfo}
+net.ipv4.ip_local_port_range=1024 65535
+net.ipv4.ip_forward=1
+net.ipv6.conf.all.forwarding=1
+fs.file-max=2097152
+fs.nr_open=2097152
+net.core.netfilter.nf_conntrack_max=1048576
 EOF
-  sysctl --system
-  echo "已开启 BBR + TCP 优化"
+  if [[ "$ENABLE_MPTCP" == "true" ]]; then
+    echo "net.mptcp.enabled=1" >>/etc/sysctl.d/99-vpn233.conf
+  fi
+  sysctl --system >/dev/null 2>&1 || true
+  echo "已应用内核性能优化: congestion=${cc} tfo=${ENABLE_TCP_FASTOPEN} mptcp=${ENABLE_MPTCP}"
+}
+
+apply_resource_limits() {
+  local limit="${CONN_LIMIT:-1048576}"
+  mkdir -p /etc/security/limits.d
+  cat >/etc/security/limits.d/99-vpn233.conf <<EOF
+* soft nofile ${limit}
+* hard nofile ${limit}
+* soft nproc ${limit}
+* hard nproc ${limit}
+root soft nofile ${limit}
+root hard nofile ${limit}
+root soft nproc ${limit}
+root hard nproc ${limit}
+EOF
+  if [[ -f /etc/pam.d/common-session ]] && ! grep -q 'pam_limits.so' /etc/pam.d/common-session; then
+    echo "session required pam_limits.so" >>/etc/pam.d/common-session || true
+  fi
+  mkdir -p /etc/systemd/system.conf.d
+  cat >/etc/systemd/system.conf.d/99-vpn233.conf <<EOF
+[Manager]
+DefaultLimitNOFILE=${limit}
+DefaultLimitNPROC=${limit}
+EOF
+  command -v systemctl >/dev/null 2>&1 && systemctl daemon-reexec >/dev/null 2>&1 || true
+  ulimit -n "${limit}" 2>/dev/null || true
+  echo "已设置最大连接/文件句柄: ${limit}"
+}
+
+apply_security_hardening() {
+  if [[ "$ENABLE_HARDENING" != "true" ]]; then
+    return
+  fi
+  cat >/etc/sysctl.d/99-vpn233-security.conf <<'EOF'
+net.ipv4.tcp_syncookies=1
+net.ipv4.conf.all.rp_filter=1
+net.ipv4.conf.default.rp_filter=1
+net.ipv4.conf.all.accept_redirects=0
+net.ipv4.conf.default.accept_redirects=0
+net.ipv4.conf.all.send_redirects=0
+net.ipv4.conf.default.send_redirects=0
+net.ipv4.conf.all.accept_source_route=0
+net.ipv6.conf.all.accept_redirects=0
+net.ipv6.conf.default.accept_redirects=0
+net.ipv4.icmp_echo_ignore_broadcasts=1
+net.ipv4.icmp_ignore_bogus_error_responses=1
+kernel.kptr_restrict=2
+kernel.dmesg_restrict=1
+EOF
+  sysctl --system >/dev/null 2>&1 || true
+  echo "已应用安全加固 sysctl"
+}
+
+install_fail2ban() {
+  if [[ "$ENABLE_FAIL2BAN" != "true" ]]; then
+    return
+  fi
+  if ! command -v fail2ban-server >/dev/null 2>&1; then
+    if [[ -n "${PACKAGE_INSTALL:-}" ]]; then
+      ${PACKAGE_INSTALL} fail2ban >/dev/null 2>&1 || { echo "fail2ban 安装失败，跳过"; return; }
+    else
+      echo "无包管理器，跳过 fail2ban"
+      return
+    fi
+  fi
+  mkdir -p /etc/fail2ban/jail.d
+  cat >/etc/fail2ban/jail.d/vpn233.conf <<'EOF'
+[sshd]
+enabled = true
+port = ssh
+maxretry = 5
+findtime = 600
+bantime = 3600
+EOF
+  systemctl enable --now fail2ban >/dev/null 2>&1 || true
+  echo "已启用 fail2ban SSH 防爆破"
+}
+
+install_logrotate() {
+  if [[ "$ENABLE_LOGROTATE" != "true" ]]; then
+    return
+  fi
+  mkdir -p /etc/logrotate.d
+  cat >/etc/logrotate.d/vpn233 <<EOF
+$DATA_DIR/runtime/*.log $DATA_DIR/singbox/*.log $DATA_DIR/mihomo/*.log {
+  daily
+  rotate 7
+  compress
+  delaycompress
+  missingok
+  notifempty
+  copytruncate
+}
+EOF
+  echo "已配置日志轮转 (保留 7 天)"
+}
+
+install_watchdog() {
+  if [[ "$ENABLE_WATCHDOG" != "true" ]]; then
+    return
+  fi
+  if ! command -v systemctl >/dev/null 2>&1; then
+    echo "无 systemd，跳过看门狗"
+    return
+  fi
+  cat >/usr/local/bin/vpn233-watchdog <<'WD'
+#!/usr/bin/env bash
+for svc in vpn233-singbox vpn233-mihomo; do
+  if systemctl list-unit-files | grep -q "${svc}.service"; then
+    systemctl is-active --quiet "$svc" || systemctl restart "$svc"
+  fi
+done
+WD
+  chmod 755 /usr/local/bin/vpn233-watchdog
+  cat >/etc/systemd/system/vpn233-watchdog.service <<'EOF'
+[Unit]
+Description=vpn233 self-healing watchdog
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpn233-watchdog
+EOF
+  cat >/etc/systemd/system/vpn233-watchdog.timer <<'EOF'
+[Unit]
+Description=vpn233 watchdog timer
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=2min
+AccuracySec=10s
+[Install]
+WantedBy=timers.target
+EOF
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  systemctl enable --now vpn233-watchdog.timer >/dev/null 2>&1 || true
+  echo "已启用自愈看门狗 (每 2 分钟巡检)"
+}
+
+issue_acme_cert() {
+  if [[ "$ENABLE_ACME" != "true" ]]; then
+    return
+  fi
+  if [[ -z "$ACME_DOMAIN" ]]; then
+    echo "ACME 已开启但未提供域名，跳过"
+    return
+  fi
+  echo "申请 ACME 证书: $ACME_DOMAIN"
+  command -v ufw >/dev/null 2>&1 && ufw allow 80/tcp >/dev/null 2>&1 || true
+  command -v firewall-cmd >/dev/null 2>&1 && { firewall-cmd --add-port=80/tcp --permanent >/dev/null 2>&1 || true; firewall-cmd --reload >/dev/null 2>&1 || true; }
+  if [[ ! -f "$HOME/.acme.sh/acme.sh" ]]; then
+    curl -fsSL https://get.acme.sh | sh -s email="${ACME_EMAIL:-admin@${ACME_DOMAIN}}" >/dev/null 2>&1 || { echo "acme.sh 安装失败，继续使用自签证书"; return; }
+  fi
+  local acme="$HOME/.acme.sh/acme.sh"
+  "$acme" --set-default-ca --server letsencrypt >/dev/null 2>&1 || true
+  if "$acme" --issue -d "$ACME_DOMAIN" --standalone --keylength ec-256 --httpport 80 >/dev/null 2>&1; then
+    "$acme" --install-cert -d "$ACME_DOMAIN" --ecc \
+      --fullchain-file "$DATA_DIR/tls/server.crt" \
+      --key-file "$DATA_DIR/tls/server.key" \
+      --reloadcmd "systemctl restart vpn233-singbox 2>/dev/null || true" >/dev/null 2>&1 || true
+    SERVER_NAME="$ACME_DOMAIN"
+    echo "ACME 证书已安装到 $DATA_DIR/tls/ (自动续期已配置)"
+  else
+    echo "ACME 证书申请失败 (检查 80 端口/域名解析)，继续使用自签证书"
+  fi
 }
 
 install_dependencies() {
@@ -2389,6 +2924,10 @@ WorkingDirectory=$DATA_DIR/singbox
 ExecStart=$DATA_DIR/singbox/sing-box run -c $DATA_DIR/singbox/config.json
 Restart=always
 RestartSec=2
+LimitNOFILE=$CONN_LIMIT
+LimitNPROC=$CONN_LIMIT
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -2437,6 +2976,10 @@ WorkingDirectory=$DATA_DIR/mihomo
 ExecStart=$DATA_DIR/mihomo/mihomo -d $DATA_DIR/mihomo -f $DATA_DIR/mihomo/config.yaml
 Restart=always
 RestartSec=2
+LimitNOFILE=$CONN_LIMIT
+LimitNPROC=$CONN_LIMIT
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -2491,6 +3034,8 @@ write_runtime_metadata() {
         "vless://" + $uuid + "@" + $node_ip + ":" + ($p.port|tostring) + "?security=reality&sni=" + $reality_server + "&pbk=" + $reality_public_key + "&sid=" + $reality_short_id + "&type=tcp#" + $p.name
       elif $p.id == "singbox-vless-reality-grpc" then
         "vless://" + $uuid + "@" + $node_ip + ":" + ($p.port|tostring) + "?security=reality&sni=" + $reality_server + "&pbk=" + $reality_public_key + "&sid=" + $reality_short_id + "&type=grpc&serviceName=" + $grpc_service_name + "#" + $p.name
+      elif $p.id == "singbox-anytls" then
+        "anytls://" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "/?sni=" + $server_name + "&insecure=1#" + $p.name
       elif $p.id == "singbox-trojan" then
         "trojan://" + $password + "@" + $node_ip + ":" + ($p.port|tostring) + "?sni=" + $server_name + "#" + $p.name
       elif $p.id == "singbox-trojan-grpc" then
@@ -2534,6 +3079,8 @@ install_management_cli() {
 #!/usr/bin/env bash
 set -euo pipefail
 DATA_DIR="$DATA_DIR"
+NODE_NAME="$NODE_NAME"
+GENERATED_AT="$GENERATED_AT"
 SINGBOX_CONFIG="\$DATA_DIR/singbox/config.json"
 MANIFEST="\$DATA_DIR/runtime/node-manifest.json"
 LINKS="\$DATA_DIR/runtime/links.txt"
@@ -2581,6 +3128,96 @@ case "\${1:-help}" in
     test -n "\${2:-}" || { echo "usage: vpn233-node remove-block-domain example.com"; exit 1; }
     edit_singbox "\$(printf '.route.rules |= map(if .domain_suffix? then .domain_suffix |= map(select(. != \"%s\")) else . end) | .route.rules |= map(select((.domain_suffix? | length // 1) > 0 or (.outbound? != \"block\")))' "\$2")"
     ;;
+  stats)
+    echo "== services =="
+    command -v systemctl >/dev/null 2>&1 && systemctl is-active vpn233-singbox vpn233-mihomo 2>/dev/null || true
+    echo "== sockets =="
+    command -v ss >/dev/null 2>&1 && ss -s || true
+    echo "== conntrack =="
+    [ -r /proc/sys/net/netfilter/nf_conntrack_count ] && cat /proc/sys/net/netfilter/nf_conntrack_count || true
+    ;;
+  top)
+    command -v ss >/dev/null 2>&1 && ss -tunp 2>/dev/null | head -n 50 || netstat -tunp 2>/dev/null | head -n 50 || true
+    ;;
+  doctor)
+    echo "node: \$NODE_NAME (\$GENERATED_AT)"
+    echo "data: \$DATA_DIR"
+    for svc in vpn233-singbox vpn233-mihomo; do
+      if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q "\${svc}.service"; then
+        printf '%s: ' "\$svc"; systemctl is-active "\$svc" 2>/dev/null || true
+      fi
+    done
+    echo "congestion: \$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null || echo unknown)"
+    echo "nofile: \$(ulimit -n)"
+    if [ -f "\$DATA_DIR/tls/server.crt" ] && command -v openssl >/dev/null 2>&1; then
+      echo "cert: \$(openssl x509 -enddate -noout -in "\$DATA_DIR/tls/server.crt" 2>/dev/null || echo n/a)"
+    fi
+    ;;
+  speedtest)
+    if command -v speedtest-cli >/dev/null 2>&1; then
+      speedtest-cli --simple || true
+    else
+      echo "下载测速中 (100MB)..."
+      curl -o /dev/null -w "下行速度: %{speed_download} B/s\n" -s "https://speed.cloudflare.com/__down?bytes=104857600" || true
+    fi
+    ;;
+  version)
+    echo "vpn233-node: \$NODE_NAME (\$GENERATED_AT)"
+    [ -x "\$DATA_DIR/singbox/sing-box" ] && "\$DATA_DIR/singbox/sing-box" version 2>/dev/null | head -n1 || true
+    [ -x "\$DATA_DIR/mihomo/mihomo" ] && "\$DATA_DIR/mihomo/mihomo" -v 2>/dev/null | head -n1 || true
+    ;;
+  backup)
+    out="\${2:-/root/vpn233-backup-\$(date +%Y%m%d%H%M%S).tar.gz}"
+    tar -czf "\$out" -C "\$(dirname "\$DATA_DIR")" "\$(basename "\$DATA_DIR")" && echo "已备份到 \$out"
+    ;;
+  restore)
+    test -n "\${2:-}" || { echo "usage: vpn233-node restore <backup.tar.gz>"; exit 1; }
+    tar -xzf "\$2" -C "\$(dirname "\$DATA_DIR")" && echo "已从 \$2 恢复" && restart_services
+    ;;
+  cert-renew)
+    if [ -x "\$HOME/.acme.sh/acme.sh" ]; then
+      "\$HOME/.acme.sh/acme.sh" --renew-all --ecc || true
+      restart_services
+    else
+      echo "未安装 acme.sh"
+    fi
+    ;;
+  update)
+    arch="\$(uname -m)"
+    case "\$arch" in x86_64|amd64) a=amd64;; aarch64|arm64) a=arm64;; *) echo "不支持的架构: \$arch"; exit 1;; esac
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q vpn233-singbox.service; then
+      t="\$(curl -fsSL https://api.github.com/repos/SagerNet/sing-box/releases/latest | jq -r .tag_name)"
+      f="sing-box-\${t#v}-linux-\${a}.tar.gz"
+      if curl -fL -o "/tmp/\$f" "https://github.com/SagerNet/sing-box/releases/download/\${t}/\$f"; then
+        tar -xzf "/tmp/\$f" -C /tmp
+        b="\$(find /tmp -maxdepth 3 -type f -name sing-box | head -n1)"
+        [ -n "\$b" ] && install -m 755 "\$b" "\$DATA_DIR/singbox/sing-box" && echo "sing-box 已更新到 \$t"
+      fi
+    fi
+    if command -v systemctl >/dev/null 2>&1 && systemctl list-unit-files | grep -q vpn233-mihomo.service; then
+      mt="\$(curl -fsSL https://api.github.com/repos/MetaCubeX/mihomo/releases/latest | jq -r .tag_name)"
+      ma="mihomo-linux-\${a}-\${mt}.gz"
+      if curl -fL -o "/tmp/\$ma" "https://github.com/MetaCubeX/mihomo/releases/download/\${mt}/\${ma}"; then
+        gzip -df "/tmp/\$ma" 2>/dev/null || true
+        mb="\$(find /tmp -maxdepth 2 -type f -name 'mihomo-linux-*' | head -n1)"
+        [ -n "\$mb" ] && install -m 755 "\$mb" "\$DATA_DIR/mihomo/mihomo" && echo "mihomo 已更新到 \$mt"
+      fi
+    fi
+    restart_services
+    ;;
+  uninstall)
+    read -r -p "确认卸载 vpn233 节点? (yes/no) " ans
+    [ "\$ans" = "yes" ] || { echo "已取消"; exit 0; }
+    if command -v systemctl >/dev/null 2>&1; then
+      systemctl disable --now vpn233-singbox vpn233-mihomo vpn233-watchdog.timer >/dev/null 2>&1 || true
+      rm -f /etc/systemd/system/vpn233-singbox.service /etc/systemd/system/vpn233-mihomo.service /etc/systemd/system/vpn233-watchdog.service /etc/systemd/system/vpn233-watchdog.timer
+      systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+    rm -f /usr/local/bin/vpn233-watchdog /etc/logrotate.d/vpn233 /etc/sysctl.d/99-vpn233.conf /etc/sysctl.d/99-vpn233-security.conf
+    rm -rf "\$DATA_DIR"
+    echo "已卸载 vpn233 节点"
+    rm -f /usr/local/bin/vpn233-node
+    ;;
   reload)
     restart_services
     ;;
@@ -2589,14 +3226,24 @@ case "\${1:-help}" in
 vpn233-node status
 vpn233-node restart
 vpn233-node stop
+vpn233-node reload
 vpn233-node show-manifest
 vpn233-node show-links
 vpn233-node show-config
+vpn233-node stats
+vpn233-node top
+vpn233-node doctor
+vpn233-node speedtest
+vpn233-node version
+vpn233-node backup [path]
+vpn233-node restore <backup.tar.gz>
+vpn233-node update
+vpn233-node cert-renew
+vpn233-node uninstall
 vpn233-node enable-bt-block
 vpn233-node disable-bt-block
 vpn233-node add-block-domain example.com
 vpn233-node remove-block-domain example.com
-vpn233-node reload
 USAGE
     ;;
 esac
@@ -2650,11 +3297,17 @@ verify_services() {
 
 install_dependencies
 detect_node_ip
-install_bbr
+tune_performance
+apply_resource_limits
+apply_security_hardening
 enable_kernel_forwarding
 write_configs
+issue_acme_cert
 write_runtime_metadata
 install_management_cli
+install_logrotate
+install_fail2ban
+install_watchdog
 open_ports
 if [[ "$USE_SINGBOX" == "true" || "$USE_MIHOMO" == "true" ]]; then
   install_singbox
@@ -2679,8 +3332,11 @@ WireGuard PresharedKey: $WG_PRESHARED_KEY
 WireGuard 客户端地址: $WG_CLIENT_CIDR
 运行时清单: $DATA_DIR/runtime/node-manifest.json
 连接链接: $DATA_DIR/runtime/links.txt
-管理命令: vpn233-node
+管理命令: vpn233-node (status/stats/doctor/speedtest/backup/update/uninstall...)
 数据目录: $DATA_DIR
+拥塞控制: $TCP_CONGESTION  TFO: $ENABLE_TCP_FASTOPEN  连接上限: $CONN_LIMIT
+安全加固: $ENABLE_HARDENING  fail2ban: $ENABLE_FAIL2BAN  看门狗: $ENABLE_WATCHDOG
+ACME 证书: $ENABLE_ACME  域名: $ACME_DOMAIN
 生成时间: $GENERATED_AT
 支持端口: $PORT_LIST
 ========================================
@@ -2696,6 +3352,9 @@ $DATA_DIR = "{{.DataDir}}"
 $USE_MIHOMO = {{if .UseMihomo}}$true{{else}}$false{{end}}
 $USE_SINGBOX = {{if .UseSingbox}}$true{{else}}$false{{end}}
 $ENABLE_BBR = {{if .EnableBBR}}$true{{else}}$false{{end}}
+$ENABLE_TCP_FASTOPEN = {{if .EnableTCPFastOpen}}$true{{else}}$false{{end}}
+$ENABLE_HARDENING = {{if .EnableHardening}}$true{{else}}$false{{end}}
+$CONN_LIMIT = {{.ConnLimit}}
 $PASSWORD = "{{.Password}}"
 $GRPC_SERVICE_NAME = "{{.GRPCServiceName}}"
 $REALITY_PUBLIC_KEY = "{{.RealityPublicKey}}"
@@ -2713,10 +3372,39 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
 
 New-Item -ItemType Directory -Path "$DATA_DIR\singbox","$DATA_DIR\mihomo","$DATA_DIR\tls" -Force | Out-Null
 
-if ($ENABLE_BBR) {
-  Set-NetTCPSetting -SettingName Internet -AutoTuningLevelNormal
-  netsh int tcp set global autotuninglevel=normal > $null
+function Optimize-Performance {
+  if (-not $ENABLE_BBR) { return }
+  try {
+    Set-NetTCPSetting -SettingName Internet -AutoTuningLevelNormal -ErrorAction SilentlyContinue
+    netsh int tcp set global autotuninglevel=normal 2>$null | Out-Null
+    netsh int tcp set global rss=enabled 2>$null | Out-Null
+    netsh int tcp set global ecncapability=enabled 2>$null | Out-Null
+    netsh int tcp set supplemental Internet congestionprovider=ctcp 2>$null | Out-Null
+    if ($ENABLE_TCP_FASTOPEN) {
+      netsh int tcp set global fastopen=enabled 2>$null | Out-Null
+      netsh int tcp set global fastopenfallback=enabled 2>$null | Out-Null
+    }
+    $tcpip = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters"
+    Set-ItemProperty -Path $tcpip -Name "MaxUserPort" -Value 65534 -Type DWord -Force -ErrorAction SilentlyContinue
+    Set-ItemProperty -Path $tcpip -Name "TcpTimedWaitDelay" -Value 30 -Type DWord -Force -ErrorAction SilentlyContinue
+    Write-Output "已应用 Windows 网络性能优化 (autotuning/RSS/CTCP/TFO)"
+  } catch {
+    Write-Output "网络性能优化部分失败: $($_.Exception.Message)"
+  }
 }
+
+function Protect-Host {
+  if (-not $ENABLE_HARDENING) { return }
+  try {
+    Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -ErrorAction SilentlyContinue
+    Write-Output "已启用 Windows 防火墙加固"
+  } catch {
+    Write-Output "防火墙加固失败: $($_.Exception.Message)"
+  }
+}
+
+Optimize-Performance
+Protect-Host
 
 function Write-Config {
   $sing = @'
@@ -2799,8 +3487,10 @@ Write-Output "WireGuard 服务端公钥: $WG_SERVER_PUBLIC_KEY"
 Write-Output "WireGuard PresharedKey: $WG_PRESHARED_KEY"
 Write-Output "WireGuard 客户端地址: $WG_CLIENT_CIDR"
 Write-Output "数据目录: $DATA_DIR"
+Write-Output "性能优化: $ENABLE_BBR  TFO: $ENABLE_TCP_FASTOPEN  防火墙加固: $ENABLE_HARDENING"
+Write-Output "连接上限(参考): $CONN_LIMIT"
 Write-Output "端口列表: $($PORT_LIST -join ',')"
 Write-Output "生成时间: $GeneratedAt"
+Write-Output "管理: Start-Service/Stop-Service vpn233-singbox | vpn233-mihomo"
 Write-Output "========================================"
 `
-

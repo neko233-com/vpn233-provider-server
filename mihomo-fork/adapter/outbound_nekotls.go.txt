@@ -1,0 +1,181 @@
+// REFERENCE SKELETON — copy to `adapter/outbound/nekotls.go` in the mihomo fork.
+// Kept as .txt so it does NOT compile inside vpn233-provider-server (it imports
+// mihomo-internal packages). The struct mirrors NekoTLSOption in ../../nekotls.go.
+//
+// Package + imports assume MetaCubeX/mihomo layout (v1.18.x).
+
+package outbound
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net"
+
+	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/component/ech"
+	"github.com/metacubex/mihomo/component/proxydialer"
+	tlsC "github.com/metacubex/mihomo/component/tls"
+	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/transport/anytls"
+	"github.com/metacubex/mihomo/transport/reality"
+)
+
+type NekoTLS struct {
+	*Base
+	client *anytls.Client
+	option *NekoTLSOption
+	tlsCfg *tlsConfig
+}
+
+type NekoTLSOption struct {
+	BasicOption
+	Name              string          `proxy:"name"`
+	Server            string          `proxy:"server"`
+	Port              int             `proxy:"port"`
+	Password          string          `proxy:"password"`
+	UDP               bool            `proxy:"udp,omitempty"`
+	SNI               string          `proxy:"sni,omitempty"`
+	ALPN              []string        `proxy:"alpn,omitempty"`
+	ClientFingerprint string          `proxy:"client-fingerprint,omitempty"`
+	PaddingScheme     string          `proxy:"padding-scheme,omitempty"`
+	SkipCertVerify    bool            `proxy:"skip-cert-verify,omitempty"`
+	ECHOpts           *NekoTLSECH     `proxy:"ech-opts,omitempty"`
+	RealityOpts       *NekoTLSReality `proxy:"reality-opts,omitempty"`
+}
+
+type NekoTLSECH struct {
+	Enable bool   `proxy:"enable"`
+	Config string `proxy:"config"`
+}
+
+type NekoTLSReality struct {
+	PublicKey string `proxy:"public-key"`
+	ShortID   string `proxy:"short-id"`
+}
+
+// tlsConfig is whatever the fork wires up: either a uTLS+ECH config or a
+// Reality config. Exactly one is non-nil (validated at parse time).
+type tlsConfig struct {
+	echConfig     *ech.Config
+	realityConfig *reality.Config
+	fingerprint   tlsC.ClientHelloID
+	serverName    string
+	alpn          []string
+	insecure      bool
+}
+
+func NewNekoTLS(option NekoTLSOption) (*NekoTLS, error) {
+	if err := validateNekoTLS(option); err != nil {
+		return nil, err
+	}
+	addr := net.JoinHostPort(option.Server, fmt.Sprintf("%d", option.Port))
+
+	fp := option.ClientFingerprint
+	if fp == "" {
+		fp = "chrome"
+	}
+	helloID, err := tlsC.GetFingerprint(fp)
+	if err != nil {
+		return nil, err
+	}
+
+	cfg := &tlsConfig{
+		fingerprint: helloID,
+		serverName:  option.SNI,
+		alpn:        option.ALPN,
+		insecure:    option.SkipCertVerify,
+	}
+	switch {
+	case option.ECHOpts != nil && option.ECHOpts.Enable:
+		raw, decErr := base64.StdEncoding.DecodeString(option.ECHOpts.Config)
+		if decErr != nil {
+			return nil, fmt.Errorf("nekotls: bad ech config: %w", decErr)
+		}
+		echCfg, parseErr := ech.NewConfig(raw)
+		if parseErr != nil {
+			return nil, parseErr
+		}
+		cfg.echConfig = echCfg
+	case option.RealityOpts != nil:
+		realityCfg, realityErr := reality.NewConfig(reality.Options{
+			PublicKey:         option.RealityOpts.PublicKey,
+			ShortID:           option.RealityOpts.ShortID,
+			ServerName:        option.SNI,
+			ClientFingerprint: fp,
+		})
+		if realityErr != nil {
+			return nil, realityErr
+		}
+		cfg.realityConfig = realityCfg
+	default:
+		return nil, fmt.Errorf("nekotls: missing ech-opts or reality-opts")
+	}
+
+	client := anytls.NewClient(anytls.ClientConfig{
+		Password:      option.Password,
+		PaddingScheme: option.PaddingScheme, // "anytls"
+	})
+
+	return &NekoTLS{
+		Base: &Base{
+			name:   option.Name,
+			addr:   addr,
+			tp:     C.NekoTLS, // add this enum value in constant/adapter.go
+			udp:    option.UDP,
+			iface:  option.Interface,
+			rmark:  option.RoutingMark,
+			prefer: C.NewDNSPrefer(option.IPVersion),
+		},
+		client: client,
+		option: &option,
+		tlsCfg: cfg,
+	}, nil
+}
+
+// DialContext composes: outer (reality | utls+ech) → anytls stream.
+func (n *NekoTLS) DialContext(ctx context.Context, metadata *C.Metadata, opts ...dialer.Option) (C.Conn, error) {
+	d := proxydialer.New(n)
+	rawConn, err := d.DialContext(ctx, "tcp", n.addr)
+	if err != nil {
+		return nil, err
+	}
+
+	var tlsConn net.Conn
+	if n.tlsCfg.realityConfig != nil {
+		tlsConn, err = reality.ClientHandshake(ctx, rawConn, n.tlsCfg.serverName, n.tlsCfg.realityConfig, n.tlsCfg.fingerprint)
+	} else {
+		tlsConn, err = tlsC.ClientHandshakeWithECH(ctx, rawConn, &tlsC.Config{
+			ServerName:         n.tlsCfg.serverName,
+			NextProtos:         n.tlsCfg.alpn,
+			InsecureSkipVerify: n.tlsCfg.insecure,
+			ECHConfig:          n.tlsCfg.echConfig,
+		}, n.tlsCfg.fingerprint)
+	}
+	if err != nil {
+		_ = rawConn.Close()
+		return nil, err
+	}
+
+	streamConn, err := n.client.StreamConn(ctx, tlsConn, metadata)
+	if err != nil {
+		_ = tlsConn.Close()
+		return nil, err
+	}
+	return NewConn(streamConn, n), nil
+}
+
+func validateNekoTLS(o NekoTLSOption) error {
+	if o.Server == "" || o.Port <= 0 || o.Port > 65535 {
+		return fmt.Errorf("nekotls: bad server/port")
+	}
+	if o.Password == "" || o.SNI == "" {
+		return fmt.Errorf("nekotls: password and sni are required")
+	}
+	echEnabled := o.ECHOpts != nil && o.ECHOpts.Enable
+	realityEnabled := o.RealityOpts != nil
+	if echEnabled == realityEnabled {
+		return fmt.Errorf("nekotls: set exactly one of ech-opts(enabled)/reality-opts")
+	}
+	return nil
+}

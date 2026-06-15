@@ -101,6 +101,28 @@ try {
     Write-Host "[verify] subscribe verify"
     Invoke-RestMethod -Uri "$base/api/v1/subscribe/verify?token=$VerifyToken" -Method Get | Out-Host
 
+    Write-Host "[verify] protocols include nekotls"
+    $protocols = Invoke-RestMethod -Uri "$base/api/v1/protocols" -Method Get
+    if (-not ($protocols.id -contains "singbox-nekotls")) {
+        throw "nekotls missing from catalog"
+    }
+
+    Write-Host "[verify] subscribe convert clash-meta-nekotls"
+    $convert = Invoke-RestMethod -Uri "$base/api/v1/subscribe/convert?target=clash-meta-nekotls&node_ip=203.0.113.10&use_mihomo=true&token=$VerifyToken" -Method Get
+    if ("$convert" -notmatch "type: nekotls") {
+        throw "nekotls subscribe conversion missing type: nekotls"
+    }
+    Write-Host "[verify] nekotls subscribe conversion ok"
+
+    Write-Host "[verify] node generation features"
+    $gen = Invoke-RestMethod -Uri "$base/api/v1/local/generate.sh?node_name=v&node_ip=edge.example.com&enable_acme=true&acme_domain=edge.example.com&selected_protocols=singbox-nekotls" -Method Get
+    foreach ($kw in @("tune_performance", "apply_security_hardening", "install_watchdog", "issue_acme_cert")) {
+        if ("$gen" -notmatch [regex]::Escape($kw)) {
+            throw "generated node script missing $kw"
+        }
+    }
+    Write-Host "[verify] node generation features ok"
+
     Write-Host "[verify] done"
 } finally {
     if ($serverProcess -and -not $serverProcess.HasExited) {

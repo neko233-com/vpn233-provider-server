@@ -1,0 +1,357 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vpn233-provider-server · NekoTLS 高性能一键 VPN 节点</title>
+<meta name="description" content="Agent-first VPN provider server：NekoTLS 自研协议、超高性能内核调优、安全加固、ACME、一键节点与多目标订阅转换。">
+<style>
+  :root{
+    --bg:#0b1120; --bg2:#0f172a; --card:#111c34; --border:#27324a;
+    --fg:#e2e8f0; --muted:#94a3b8; --dim:#64748b;
+    --accent:#60a5fa; --accent2:#a78bfa; --ok:#34d399; --warn:#fbbf24;
+    --code:#0a1020;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:linear-gradient(180deg,#0b1120,#0d1426 60%,#0b1120);color:var(--fg);
+    font-family:"Inter","PingFang SC","Microsoft YaHei",system-ui,Arial,sans-serif;line-height:1.65}
+  a{color:var(--accent);text-decoration:none}
+  a:hover{text-decoration:underline}
+  code,pre{font-family:ui-monospace,"SF Mono",Consolas,Menlo,monospace}
+  .wrap{max-width:1080px;margin:0 auto;padding:0 20px}
+  header.nav{position:sticky;top:0;z-index:20;backdrop-filter:blur(10px);
+    background:rgba(11,17,32,.78);border-bottom:1px solid var(--border)}
+  .nav .wrap{display:flex;align-items:center;gap:18px;height:60px}
+  .brand{font-weight:800;font-size:18px;color:#fff;letter-spacing:.3px}
+  .brand b{color:var(--accent)}
+  .nav nav{display:flex;gap:18px;margin-left:auto;flex-wrap:wrap}
+  .nav nav a{color:var(--muted);font-size:14px}
+  .nav nav a:hover{color:#fff;text-decoration:none}
+  .hero{padding:72px 0 48px;text-align:center}
+  .hero h1{font-size:44px;line-height:1.15;margin:0 0 14px;color:#fff;font-weight:800}
+  .hero h1 .grad{background:linear-gradient(90deg,#60a5fa,#a78bfa);-webkit-background-clip:text;background-clip:text;color:transparent}
+  .hero p.lead{font-size:19px;color:var(--muted);max-width:760px;margin:0 auto 28px}
+  .badges{display:flex;gap:10px;justify-content:center;flex-wrap:wrap;margin-bottom:28px}
+  .badge{font-size:12px;color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:4px 12px;background:var(--card)}
+  .cta{display:flex;gap:12px;justify-content:center;flex-wrap:wrap}
+  .btn{display:inline-block;padding:12px 22px;border-radius:10px;font-weight:600;font-size:15px;border:1px solid transparent;cursor:pointer}
+  .btn.primary{background:linear-gradient(90deg,#2563eb,#7c3aed);color:#fff}
+  .btn.primary:hover{filter:brightness(1.1);text-decoration:none}
+  .btn.ghost{background:var(--card);border-color:var(--border);color:var(--fg)}
+  .btn.ghost:hover{border-color:var(--accent);text-decoration:none}
+  section{padding:46px 0;border-top:1px solid rgba(39,50,74,.5)}
+  section h2{font-size:28px;color:#fff;margin:0 0 8px}
+  section .sub{color:var(--muted);margin:0 0 26px;font-size:16px}
+  .grid{display:grid;gap:16px}
+  .grid.c3{grid-template-columns:repeat(3,1fr)}
+  .grid.c2{grid-template-columns:repeat(2,1fr)}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:20px}
+  .card h3{margin:0 0 8px;color:#fff;font-size:17px;display:flex;align-items:center;gap:8px}
+  .card p{margin:0;color:var(--muted);font-size:14px}
+  .ico{width:30px;height:30px;border-radius:8px;display:inline-flex;align-items:center;justify-content:center;
+    background:linear-gradient(135deg,#1d4ed8,#7c3aed);font-size:16px}
+  pre{background:var(--code);border:1px solid var(--border);border-radius:12px;padding:16px 18px;overflow:auto;font-size:13.5px;position:relative}
+  pre code{color:#cbd5e1}
+  .tok{color:#7dd3fc}.tok2{color:#c4b5fd}.tok3{color:#86efac}.cmt{color:#64748b}
+  .copy{position:absolute;top:10px;right:10px;background:#1e293b;border:1px solid var(--border);color:var(--muted);
+    font-size:12px;border-radius:6px;padding:3px 9px;cursor:pointer}
+  .copy:hover{color:#fff;border-color:var(--accent)}
+  table{width:100%;border-collapse:collapse;font-size:13.5px;overflow:hidden;border-radius:12px;border:1px solid var(--border)}
+  th,td{padding:10px 12px;text-align:left;border-bottom:1px solid var(--border)}
+  th{background:#16213b;color:#cbd5e1;font-weight:600}
+  td{color:var(--muted)}
+  tr:last-child td{border-bottom:none}
+  td b,td strong{color:var(--fg)}
+  .pill{display:inline-block;font-size:11px;padding:1px 8px;border-radius:999px;border:1px solid var(--border);color:var(--muted)}
+  .pill.ok{color:var(--ok);border-color:rgba(52,211,153,.4)}
+  .pill.star{color:var(--warn);border-color:rgba(251,191,36,.4)}
+  .tabs{display:flex;gap:8px;margin-bottom:12px}
+  .tab{padding:7px 16px;border-radius:8px;border:1px solid var(--border);background:var(--card);color:var(--muted);cursor:pointer;font-size:14px}
+  .tab.active{color:#fff;border-color:var(--accent);background:#16213b}
+  .panel{display:none}.panel.active{display:block}
+  ul.feat{margin:0;padding-left:18px;color:var(--muted);font-size:14px}
+  ul.feat li{margin:5px 0}
+  ul.feat b{color:var(--fg)}
+  footer{padding:40px 0;border-top:1px solid var(--border);color:var(--dim);text-align:center;font-size:14px}
+  .anchor{display:block;position:relative;top:-72px;visibility:hidden}
+  @media(max-width:820px){
+    .grid.c3,.grid.c2{grid-template-columns:1fr}
+    .hero h1{font-size:32px}.nav nav{display:none}
+  }
+</style>
+</head>
+<body>
+<header class="nav">
+  <div class="wrap">
+    <div class="brand">vpn<b>233</b> · provider</div>
+    <nav>
+      <a href="#features">特性</a>
+      <a href="#quickstart">快速开始</a>
+      <a href="#perf">性能</a>
+      <a href="#nekotls">NekoTLS</a>
+      <a href="#protocols">协议</a>
+      <a href="#api">API</a>
+      <a href="#cli">管理 CLI</a>
+      <a href="https://github.com/neko233-com/vpn233-provider-server">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<div class="hero">
+  <div class="wrap">
+    <div class="badges">
+      <span class="badge">Go 1.26</span>
+      <span class="badge">sing-box · mihomo</span>
+      <span class="badge">NekoTLS 自研协议</span>
+      <span class="badge">百万级连接调优</span>
+      <span class="badge">MIT</span>
+    </div>
+    <h1>一键部署的 <span class="grad">高性能 VPN 节点</span><br>与多目标订阅转换</h1>
+    <p class="lead">Agent-first 的 VPN provider 管理端：内置协议能力矩阵、NekoTLS（ECH/Reality 伪装）、
+      超高性能内核调优、安全加固、ACME 证书、自愈看门狗，一条命令落地 sing-box / mihomo 节点。</p>
+    <div class="cta">
+      <a class="btn primary" href="#quickstart">立即开始</a>
+      <a class="btn ghost" href="https://github.com/neko233-com/vpn233-provider-server">查看源码</a>
+      <a class="btn ghost" href="how-it-work.html">工作原理</a>
+    </div>
+  </div>
+</div>
+
+<span class="anchor" id="features"></span>
+<section>
+  <div class="wrap">
+    <h2>核心特性</h2>
+    <p class="sub">VPN 节点该有的功能，全部落地。</p>
+    <div class="grid c3">
+      <div class="card"><h3><span class="ico">🧩</span>27+ 协议模板</h3><p>sing-box 与 mihomo 双核，NekoTLS / VLESS-Reality / AnyTLS / Hysteria2 / TUIC / WireGuard / Trojan / VMess / Shadowsocks 等开箱即用。</p></div>
+      <div class="card"><h3><span class="ico">🐾</span>NekoTLS 自研协议</h3><p>AnyTLS 外层 + uTLS 指纹 + ECH（域名隐藏 SNI）+ Reality 借壳（免域名）。sing-box 原生 anytls 落地，Clash 经 fork 原生 type: nekotls。</p></div>
+      <div class="card"><h3><span class="ico">⚡</span>超高性能内核</h3><p>BBR / 自定义拥塞控制、TCP Fast Open、MPTCP、128MB 读写缓冲、百万级 conntrack 与文件句柄。</p></div>
+      <div class="card"><h3><span class="ico">🛡️</span>安全加固</h3><p>sysctl 加固、fail2ban SSH 防爆破、systemd 资源限额与能力收敛，最小权限运行。</p></div>
+      <div class="card"><h3><span class="ico">🔐</span>ACME 正式证书</h3><p>有域名自动 acme.sh 签发 Let's Encrypt，自动续期；失败回退自签，不中断部署。</p></div>
+      <div class="card"><h3><span class="ico">🩺</span>可运维</h3><p>自愈看门狗、日志轮转、一键 backup/restore/update/uninstall、speedtest、doctor 体检。</p></div>
+      <div class="card"><h3><span class="ico">🔁</span>多目标订阅转换</h3><p>clash-meta-nekotls / clash / clash-meta / sing-box / links 一接口输出；stock 核心自动降级 anytls。</p></div>
+      <div class="card"><h3><span class="ico">🖥️</span>面板 · CLI · 本地 HTTP</h3><p>浏览器面板 + agent-first CLI + 回环免登录接口，方便人、脚本、Agent 三种编排。</p></div>
+      <div class="card"><h3><span class="ico">✅</span>自动化验收</h3><p>go test + bash -n 语法校验 + 端到端 verify 脚本，发布前全链路可验证。</p></div>
+    </div>
+  </div>
+</section>
+
+<span class="anchor" id="quickstart"></span>
+<section>
+  <div class="wrap">
+    <h2>快速开始</h2>
+    <p class="sub">先跑管理端，再一键生成节点安装脚本。</p>
+    <div class="tabs">
+      <div class="tab active" data-tab="linux">Linux 管理端</div>
+      <div class="tab" data-tab="win">Windows 管理端</div>
+      <div class="tab" data-tab="dev">本地开发</div>
+    </div>
+    <div class="panel active" data-panel="linux">
+<pre><button class="copy">复制</button><code><span class="cmt"># 一键安装 provider 管理端</span>
+bash &lt;(curl -fsSL https://raw.githubusercontent.com/neko233-com/vpn233-provider-server/main/install-server.sh)
+<span class="cmt"># 默认面板：http://&lt;ip&gt;:8080/  账号 root / root</span></code></pre>
+    </div>
+    <div class="panel" data-panel="win">
+<pre><button class="copy">复制</button><code>Invoke-WebRequest -UseBasicParsing `
+  https://raw.githubusercontent.com/neko233-com/vpn233-provider-server/main/install-server.ps1 `
+  -OutFile install-server.ps1
+powershell -ExecutionPolicy Bypass -File .\install-server.ps1</code></pre>
+    </div>
+    <div class="panel" data-panel="dev">
+<pre><button class="copy">复制</button><code>go mod tidy
+go test ./...
+go run .   <span class="cmt"># http://0.0.0.0:8080/</span></code></pre>
+    </div>
+    <p class="sub" style="margin-top:22px">生成一个 NekoTLS 节点的安装脚本（免登录本地接口）：</p>
+<pre><button class="copy">复制</button><code>curl <span class="tok3">"http://127.0.0.1:8080/api/v1/local/generate.sh?node_ip=edge.example.com\
+&amp;enable_acme=true&amp;acme_domain=edge.example.com\
+&amp;selected_protocols=singbox-nekotls,mihomo-nekotls"</span> -o install-node.sh
+sudo bash install-node.sh</code></pre>
+  </div>
+</section>
+
+<span class="anchor" id="perf"></span>
+<section>
+  <div class="wrap">
+    <h2>超高性能 + 安全加固</h2>
+    <p class="sub">生成的节点脚本自动写入并应用以下调优（均可开关）。</p>
+    <div class="grid c2">
+      <div class="card">
+        <h3>⚡ 性能调优 <span class="pill">/etc/sysctl.d/99-vpn233.conf</span></h3>
+        <ul class="feat">
+          <li><b>拥塞控制</b>：BBR + fq（可切 cubic 等），自动 modprobe tcp_bbr</li>
+          <li><b>大缓冲</b>：rmem/wmem 128MB，UDP min 缓冲利好 QUIC/Hysteria2/TUIC</li>
+          <li><b>高并发</b>：somaxconn / syn_backlog 65535，netdev_backlog 250000，tw_reuse</li>
+          <li><b>TFO</b>：tcp_fastopen=3；<b>MPTCP</b>：可选 net.mptcp.enabled</li>
+          <li><b>句柄</b>：file-max 2097152，limits.d + systemd DefaultLimitNOFILE</li>
+          <li><b>服务加固</b>：LimitNOFILE/NPROC + 网络能力 capability</li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>🛡️ 安全 / 运维</h3>
+        <ul class="feat">
+          <li><b>sysctl 加固</b>：syncookies、rp_filter、禁重定向/源路由、kptr/dmesg 限制</li>
+          <li><b>fail2ban</b>：sshd jail 防爆破（best-effort，不中断）</li>
+          <li><b>ACME</b>：acme.sh standalone 签发 + 自动续期，失败回退自签</li>
+          <li><b>看门狗</b>：systemd timer 每 2 分钟自愈拉起异常服务</li>
+          <li><b>日志轮转</b>：logrotate 保留 7 天，copytruncate</li>
+          <li><b>一键运维</b>：backup / restore / update / uninstall / speedtest / doctor</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<span class="anchor" id="nekotls"></span>
+<section>
+  <div class="wrap">
+    <h2>NekoTLS · neko233 旗舰协议</h2>
+    <p class="sub">把 uTLS 指纹 + ECH + Reality + AnyTLS padding 统一封装成单一 type。</p>
+    <div class="grid c2">
+      <div class="card">
+        <h3>设计</h3>
+        <ul class="feat">
+          <li><b>外层线路</b>：AnyTLS 兼容流（TLS 1.3 + padding + 多路复用）</li>
+          <li><b>服务端</b>：stock sing-box 原生 <code>anytls</code> 入站即可落地</li>
+          <li><b>域名模式</b>：ECH 隐藏真实 SNI，校验正式证书</li>
+          <li><b>免域名模式</b>：Reality 借壳，sni 指向借壳站点</li>
+          <li><b>客户端</b>：mihomo fork 原生 <code>type: nekotls</code></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>为什么需要 fork</h3>
+        <p>stock 核心无法解析未知 <code>type:</code>，且官方 mihomo 不支持
+          AnyTLS + Reality 组合、也不能把指纹/ECH/Reality 收敛进单一出站。
+          fork 仅改动<b>出站解析 + 一个 outbound</b>，伪装能力全部复用
+          mihomo 既有的 <code>anytls / ech / reality / utls</code> 组件。</p>
+        <p style="margin-top:10px">契约 <code>NekoTLSOption</code> / <code>DecodeNekoTLSOption</code>
+          由 provider 与 fork 共享；CI 用同一解码器校验所有生成产物，保证可加载。
+          详见 <a href="https://github.com/neko233-com/vpn233-provider-server/blob/main/mihomo-fork/PLAN.md">mihomo-fork/PLAN.md</a>。</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<span class="anchor" id="protocols"></span>
+<section>
+  <div class="wrap">
+    <h2>协议能力矩阵</h2>
+    <p class="sub">根据是否提供域名自动推荐默认协议。</p>
+    <table>
+      <thead><tr><th>协议</th><th>核心</th><th>免域名</th><th>ECH</th><th>Reality</th><th>推荐场景</th></tr></thead>
+      <tbody>
+        <tr><td><b>NekoTLS</b></td><td>sing-box / mihomo</td><td><span class="pill ok">是</span></td><td><span class="pill ok">支持</span></td><td><span class="pill ok">支持</span></td><td><span class="pill star">旗舰默认</span></td></tr>
+        <tr><td>VLESS-Reality(-gRPC)</td><td>sing-box / mihomo</td><td><span class="pill ok">是</span></td><td>—</td><td><span class="pill ok">支持</span></td><td>免域名默认</td></tr>
+        <tr><td>AnyTLS</td><td>sing-box / mihomo</td><td><span class="pill ok">是</span></td><td>mihomo</td><td>—</td><td>有域名兼容</td></tr>
+        <tr><td>Hysteria2 / TUIC</td><td>sing-box / mihomo</td><td>是</td><td>—</td><td>—</td><td>UDP/高延迟</td></tr>
+        <tr><td>WireGuard</td><td>sing-box / mihomo</td><td>是</td><td>—</td><td>—</td><td>原生隧道</td></tr>
+        <tr><td>Trojan(-gRPC)</td><td>sing-box / mihomo</td><td>—</td><td>—</td><td>—</td><td>域名兼容补位</td></tr>
+        <tr><td>VMess(-WS) / VLESS(-gRPC)</td><td>sing-box / mihomo</td><td>部分</td><td>—</td><td>—</td><td>兼容旧客户端</td></tr>
+        <tr><td>Shadowsocks 2022</td><td>sing-box / mihomo</td><td>是</td><td>—</td><td>—</td><td>备用协议</td></tr>
+        <tr><td>SOCKS5 / HTTP</td><td>sing-box</td><td>是</td><td>—</td><td>—</td><td>内网调试</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<span class="anchor" id="subscribe"></span>
+<section>
+  <div class="wrap">
+    <h2>订阅转换 target</h2>
+    <p class="sub"><code>GET /api/v1/subscribe/convert?target=&lt;target&gt;&amp;node_ip=&lt;ip&gt;</code></p>
+    <table>
+      <thead><tr><th>target</th><th>输出</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td><b>clash-meta-nekotls</b></td><td>mihomo(fork) YAML</td><td>默认目标，保证含 <code>type: nekotls</code></td></tr>
+        <tr><td>clash-meta / clash</td><td>mihomo/clash YAML</td><td>自动把 NekoTLS 降级为 anytls，stock 核心可解析</td></tr>
+        <tr><td>sing-box</td><td>sing-box JSON</td><td>原生 anytls 入站等价配置</td></tr>
+        <tr><td>links</td><td>文本</td><td>分享链接（含 nekotls://）</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<span class="anchor" id="api"></span>
+<section>
+  <div class="wrap">
+    <h2>API 速查</h2>
+    <p class="sub">登录获取 Bearer token；回环地址可走 <code>/api/v1/local/*</code> 免登录接口。</p>
+    <div class="grid c2">
+      <div class="card">
+        <h3>主要接口</h3>
+        <ul class="feat">
+          <li><code>POST /api/v1/login</code></li>
+          <li><code>GET /api/v1/health</code> · <code>/protocols</code> · <code>/config</code></li>
+          <li><code>POST /api/v1/generate</code> · <code>GET /generate.sh|.ps1</code></li>
+          <li><code>GET /api/v1/subscribe/verify</code></li>
+          <li><code>GET /api/v1/subscribe/convert</code></li>
+          <li><code>GET /repo/status</code> · <code>POST /repo/sync</code></li>
+        </ul>
+      </div>
+      <div class="card">
+        <h3>generate 性能/安全参数</h3>
+        <ul class="feat">
+          <li><code>enable_bbr</code> · <code>tcp_congestion</code> · <code>enable_tcp_fastopen</code> · <code>enable_mptcp</code></li>
+          <li><code>conn_limit</code>（默认 1048576）</li>
+          <li><code>enable_hardening</code> · <code>enable_fail2ban</code></li>
+          <li><code>enable_logrotate</code> · <code>enable_watchdog</code></li>
+          <li><code>enable_acme</code> · <code>acme_domain</code> · <code>acme_email</code></li>
+          <li><code>selected_protocols</code> · <code>node_ip</code> · <code>port_base</code></li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<span class="anchor" id="cli"></span>
+<section>
+  <div class="wrap">
+    <h2>节点管理 CLI（vpn233-node）</h2>
+    <p class="sub">安装脚本自动写入 <code>/usr/local/bin/vpn233-node</code>。</p>
+<pre><button class="copy">复制</button><code><span class="cmt"># 服务</span>
+vpn233-node status | restart | stop | reload
+<span class="cmt"># 观测与诊断</span>
+vpn233-node stats | top | doctor | speedtest | version
+<span class="cmt"># 运维</span>
+vpn233-node backup [path] | restore &lt;file.tar.gz&gt;
+vpn233-node update | cert-renew | uninstall
+<span class="cmt"># 路由策略</span>
+vpn233-node show-manifest | show-links | show-config
+vpn233-node enable-bt-block | disable-bt-block
+vpn233-node add-block-domain example.com | remove-block-domain example.com</code></pre>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <p>vpn233-provider-server · MIT License ·
+      <a href="https://github.com/neko233-com/vpn233-provider-server">GitHub</a> ·
+      <a href="how-it-work.html">工作原理</a></p>
+    <p style="color:#475569">仅用于合法合规的网络访问与研发联调用途。</p>
+  </div>
+</footer>
+
+<script>
+  document.querySelectorAll('.tab').forEach(function(t){
+    t.addEventListener('click', function(){
+      var key = t.getAttribute('data-tab');
+      document.querySelectorAll('.tab').forEach(function(x){x.classList.remove('active')});
+      t.classList.add('active');
+      document.querySelectorAll('.panel').forEach(function(p){
+        p.classList.toggle('active', p.getAttribute('data-panel') === key);
+      });
+    });
+  });
+  document.querySelectorAll('.copy').forEach(function(b){
+    b.addEventListener('click', function(){
+      var code = b.parentElement.querySelector('code').innerText;
+      navigator.clipboard.writeText(code).then(function(){
+        var old = b.textContent; b.textContent = '已复制';
+        setTimeout(function(){ b.textContent = old; }, 1400);
+      });
+    });
+  });
+</script>
+</body>
+</html>

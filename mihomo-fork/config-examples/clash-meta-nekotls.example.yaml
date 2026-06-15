@@ -1,0 +1,68 @@
+# clash-meta-nekotls subscription example (forked mihomo).
+# Generated shape produced by:
+#   GET /api/v1/subscribe/convert?target=clash-meta-nekotls&node_ip=...
+# `mihomo -t -f clash-meta-nekotls.example.yaml` must parse `type: nekotls`.
+
+mixed-port: 7890
+allow-lan: true
+mode: rule
+log-level: info
+external-controller: 127.0.0.1:9090
+
+proxies:
+  # no-domain (IP) node -> Reality fallback
+  - name: nekotls-10000
+    type: nekotls
+    server: 203.0.113.10
+    port: 10000
+    password: "S3cr3tPassw0rd"
+    udp: true
+    sni: "www.cloudflare.com"
+    alpn:
+      - h2
+      - http/1.1
+    client-fingerprint: chrome
+    padding-scheme: anytls
+    skip-cert-verify: true
+    reality-opts:
+      public-key: "0rEXAMPLErealitypublickeybase64url"
+      short-id: "a1b2c3d4"
+
+  # domain node -> ECH (SNI concealment)
+  - name: nekotls-10011
+    type: nekotls
+    server: edge.example.com
+    port: 10011
+    password: "S3cr3tPassw0rd"
+    udp: true
+    sni: "edge.example.com"
+    alpn:
+      - h2
+      - http/1.1
+    client-fingerprint: chrome
+    padding-scheme: anytls
+    skip-cert-verify: false
+    ech-opts:
+      enable: true
+      config: "AEX+DQBA..."   # base64 ECHConfigList emitted by the provider
+
+proxy-groups:
+  - name: PROXY
+    type: select
+    proxies:
+      - AUTO
+      - DIRECT
+      - nekotls-10000
+      - nekotls-10011
+  - name: AUTO
+    type: url-test
+    url: http://www.gstatic.com/generate_204
+    interval: 300
+    tolerance: 50
+    proxies:
+      - nekotls-10000
+      - nekotls-10011
+
+rules:
+  - GEOIP,CN,DIRECT,no-resolve
+  - MATCH,PROXY
