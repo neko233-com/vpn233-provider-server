@@ -5,34 +5,47 @@ PORT="${VPN233_VERIFY_PORT:-18888}"
 VERIFY_TOKEN="${VPN233_VERIFY_TOKEN:-verify-token}"
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 TMP_DIR="$(mktemp -d)"
-CFG_FILE="$TMP_DIR/agent-config.json"
+CFG_FILE="$TMP_DIR/server.yaml"
 LOG_FILE="$TMP_DIR/server.log"
-ORIG_CFG="$ROOT_DIR/agent-config.json"
+ORIG_CFG="$ROOT_DIR/server.yaml"
 BACKUP_CFG=""
 
-cat >"$CFG_FILE" <<JSON
-{
-  "listen_addr": "127.0.0.1",
-  "listen_port": $PORT,
-  "admin_user": "root",
-  "admin_password": "root",
-  "default_data_dir": "/tmp/vpn233",
-  "default_node_ip": "",
-  "default_port_base": 10000,
-  "default_enable_bbr": true,
-  "default_use_mihomo": false,
-  "default_use_singbox": true,
-  "subscribe_repo_url": "https://github.com/neko233-com/vpn233-subscribe-server.git",
-  "subscribe_repo_path": "vpn233-subscribe-server",
-  "subscribe_repo_branch": "main",
-  "subscribe_verify_token": "$VERIFY_TOKEN"
-}
-JSON
+cat >"$CFG_FILE" <<YAML
+listen_addr: "127.0.0.1"
+listen_port: $PORT
+admin_user: "root"
+admin_password: "root"
+default_data_dir: "/tmp/vpn233"
+default_node_ip: ""
+default_port_base: 10000
+default_enable_bbr: true
+default_use_mihomo: false
+default_use_singbox: true
+subscribe_repo_url: "https://github.com/neko233-com/vpn233-subscribe-server.git"
+subscribe_repo_path: "vpn233-subscribe-server"
+subscribe_repo_branch: "main"
+subscribe_verify_token: "$VERIFY_TOKEN"
+proxysss:
+  enabled: true
+  admin_url: "http://127.0.0.1:7777"
+  bearer_token: "proxysss-test-token"
+  provider_subdomain: "panel"
+  upstream: "http://127.0.0.1:$PORT"
+dns_automation:
+  enabled: true
+  provider: "cloudflare"
+  api_token: "cf-test-token"
+  email: "ops@example.com"
+  base_domain: "example.com"
+  production: true
+  challenge: "dns01"
+  create_wildcard: true
+YAML
 
 cleanup() {
   if [[ -n "$BACKUP_CFG" ]] && [[ -f "$BACKUP_CFG" ]]; then
     mv -f "$BACKUP_CFG" "$ORIG_CFG"
-  elif [[ -f "$ORIG_CFG" ]] && [[ ! -f "$TMP_DIR/agent-config.json.orig" ]]; then
+  elif [[ -f "$ORIG_CFG" ]] && [[ ! -f "$TMP_DIR/server.yaml.orig" ]]; then
     rm -f "$ORIG_CFG"
   fi
   if [[ -n "${SERVER_PID:-}" ]] && kill -0 "$SERVER_PID" 2>/dev/null; then
@@ -47,8 +60,8 @@ echo "[verify] run tests"
 go test ./...
 
 if [[ -f "$ORIG_CFG" ]]; then
-  cp "$ORIG_CFG" "$TMP_DIR/agent-config.json.orig"
-  BACKUP_CFG="$TMP_DIR/agent-config.json.orig"
+  cp "$ORIG_CFG" "$TMP_DIR/server.yaml.orig"
+  BACKUP_CFG="$TMP_DIR/server.yaml.orig"
 fi
 cp "$CFG_FILE" "$ORIG_CFG"
 
@@ -106,5 +119,12 @@ for kw in tune_performance apply_security_hardening install_watchdog issue_acme_
   echo "$GEN" | grep -q "$kw" || { echo "[verify] generated node script missing $kw"; exit 1; }
 done
 echo "[verify] node generation features ok"
+
+echo "[verify] proxysss gateway yaml"
+GATEWAY=$(curl -sf "http://127.0.0.1:$PORT/api/v1/local/gateway/proxysss.yaml")
+for kw in "challenge: dns01" "provider: cloudflare" "name: vpn233-provider-panel"; do
+  echo "$GATEWAY" | grep -q "$kw" || { echo "[verify] proxysss gateway plan missing $kw"; exit 1; }
+done
+echo "[verify] proxysss gateway yaml ok"
 
 echo "[verify] done"

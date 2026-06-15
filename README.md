@@ -1,6 +1,9 @@
 # vpn233-provider-server
 
+![CI](https://github.com/neko233-com/vpn233-provider-server/actions/workflows/ci.yml/badge.svg)
+
 > 文档站点（GitHub Pages）：<https://neko233-com.github.io/vpn233-provider-server/>
+> Agent First 文档：<https://neko233-com.github.io/vpn233-provider-server/agent-first.html>
 
 Go 1.26 版本的 agent-first VPN 管理端，面向 **provider-server** 与 **subscribe-server** 的一体化联调场景，提供：
 
@@ -15,6 +18,8 @@ Go 1.26 版本的 agent-first VPN 管理端，面向 **provider-server** 与 **s
 - **可运维性**：ACME 正式证书自动签发/续期、自愈看门狗、日志轮转、一键备份/恢复/更新/卸载
 - 裸脚本下载接口与 provider 管理面板自安装脚本
 - 与订阅服务器联动的验收接口与仓库自动状态检查
+- **proxysss 网关联动**：一键生成 `proxysss.yaml`、通过 proxysss admin API 自动注册 provider 路由
+- **server.yaml 单文件配置**：provider 主配置只写 `server.yaml`；旧 `agent-config.json` 仅用于自动迁移
 
 > 说明：目标是“可落地的傻瓜化一键配置 + 高性能 + 订阅验收能力”，并不承担完整流量计费系统。
 
@@ -39,7 +44,7 @@ flowchart LR
 
 ## 运行行为（与订阅仓库联动）
 
-服务启动时会读取 `agent-config.json` 并执行仓库状态检查：
+服务启动时会读取 `server.yaml` 并执行仓库状态检查：
 
 - 当前目录是 root git 仓库时：不强制再次拉取
 - 当前目录为子 git 仓库时：跳过对 `vpn233-subscribe-server` 的自动拉取
@@ -82,7 +87,7 @@ powershell -ExecutionPolicy Bypass -File .\install-server.ps1
 
 - 安装或检查 `Go 1.26`
 - 拉取/更新 `vpn233-provider-server`
-- 生成默认 `agent-config.json`
+- 生成默认 `server.yaml`
 - 注册 `vpn233-provider-server` 常驻服务
 - 自动放行管理面板端口
 - 安装管理命令：Linux `vpn233-provider`，Windows `vpn233-provider.ps1`
@@ -107,6 +112,8 @@ powershell -ExecutionPolicy Bypass -File .\install-server.ps1
 - `POST /api/v1/repo/sync`（管理认证）
 - `GET /api/v1/subscribe/verify`（供订阅服务调用，支持 `token`）
 - `GET /api/v1/subscribe/convert`（订阅转换，支持 `target` 与 `token`）
+- `GET /api/v1/gateway/proxysss.yaml`（生成 proxysss 网关 + DNS-01 ACME YAML，管理认证）
+- `POST /api/v1/gateway/register`（通过 proxysss admin API 自动注册 provider 路由，管理认证）
 
 `GET` 生成接口支持 query 参数：
 
@@ -240,6 +247,63 @@ curl "http://127.0.0.1:8080/api/v1/subscribe/verify?token=VERIFY_TOKEN"
 curl "http://127.0.0.1:8080/api/v1/generate.sh?node_ip=edge.example.com&enable_acme=true&acme_domain=edge.example.com&acme_email=ops@example.com&selected_protocols=singbox-nekotls"
 ```
 
+## server.yaml（唯一主配置）
+
+provider 现在只写 `server.yaml`。如果工作目录里仍有旧的 `agent-config.json`，启动时会自动读取并迁移到同目录的 `server.yaml`。
+
+```yaml
+listen_addr: "0.0.0.0"
+listen_port: 8080
+admin_user: "root"
+admin_password: "root"
+
+proxysss:
+  enabled: true
+  admin_url: "http://127.0.0.1:7777"
+  bearer_token: "change-me"
+  provider_route_name: "vpn233-provider-panel"
+  provider_subdomain: "panel"
+  upstream: "http://127.0.0.1:8080"
+
+dns_automation:
+  enabled: true
+  provider: "cloudflare"
+  api_token: "cf-token"
+  email: "ops@example.com"
+  base_domain: "example.com"
+  production: true
+  challenge: "dns01"
+  create_wildcard: true
+```
+
+完整示例见 [server.yaml](server.yaml)。
+
+## proxysss 网关 + DNS 自动化
+
+`proxysss` 本身是 **YAML-only** 网关，因此 provider 直接对接它的单文件配置和 admin automation API：
+
+- **Gateway 计划**：`GET /api/v1/gateway/proxysss.yaml` 生成完整 `proxysss.yaml`
+- **DNS-01 ACME**：读取 `dns_automation.*` 生成 `http.tls.mode=acme_managed` + `challenge=dns01`
+- **自动注册**：`POST /api/v1/gateway/register` 调 proxysss `POST /v1/domain-routes/upsert`
+
+生成的 gateway YAML 内置：
+
+- `http.plain_bind/tls_bind/h3_bind`
+- `admin.enable_write_ops=true`
+- `monitoring.path=/metrics`
+- `runtime.performance` 与 `runtime.watchdog`
+- provider 面板域名路由（默认 `panel.<base_domain>` → `http://127.0.0.1:8080`）
+
+示例：
+
+```bash
+curl -s http://127.0.0.1:8080/api/v1/local/gateway/proxysss.yaml -o proxysss.yaml
+proxysss -config ./proxysss.yaml check-config
+proxysss -config ./proxysss.yaml start
+
+curl -X POST http://127.0.0.1:8080/api/v1/local/gateway/register
+```
+
 ## 核心行为
 
 - 所有端口按 `port_base + N * 11` 自动分配
@@ -352,6 +416,7 @@ go test ./...
 - 调用 `/api/v1/subscribe/verify` 与 `/api/v1/protocols`（含 NekoTLS）
 - 调用 `/api/v1/subscribe/convert?target=clash-meta-nekotls` 并断言 `type: nekotls`
 - 生成全量节点脚本并断言含 `tune_performance/apply_security_hardening/install_watchdog/issue_acme_cert`
+- 生成 `proxysss` 网关 YAML 并断言含 `challenge: dns01` / `provider: cloudflare`
 - 清理服务进程
 
 ### Shell 脚本语法校验
@@ -375,6 +440,8 @@ powershell -File scripts/verify.ps1
 ```
 
 ## Agent First 操作面
+
+完整 Agent First 文档见 [docs/agent-first.html](docs/agent-first.html)。
 
 ### CLI
 
@@ -410,6 +477,8 @@ go run . generate --format sh --node-name edge-01 --node-ip 203.0.113.10
 - `config get`
 - `config set`
 - `generate`
+- `gateway-plan`
+- `gateway-register`
 
 ### 本地 HTTP（免登录，仅回环）
 
@@ -423,6 +492,8 @@ go run . generate --format sh --node-name edge-01 --node-ip 203.0.113.10
 - `GET /api/v1/local/generate.ps1`
 - `GET /api/v1/local/repo/status`
 - `POST /api/v1/local/repo/sync`
+- `GET /api/v1/local/gateway/proxysss.yaml`
+- `POST /api/v1/local/gateway/register`
 
 示例：
 
@@ -452,11 +523,13 @@ curl "http://127.0.0.1:8080/api/v1/local/generate.sh?node_name=edge-01&node_ip=2
 ## 注意
 
 - 脚本默认使用 GitHub Releases 最新版本，网络受限环境建议先配置镜像或固定版本后再发布
-- 管理面板会优先读取环境变量 `VPN233_CONFIG_PATH`，否则尝试读取可执行文件同目录的 `agent-config.json`
+- 管理面板会优先读取环境变量 `VPN233_CONFIG_PATH`，否则优先读取可执行文件同目录或当前目录下的 `server.yaml`
+- 如果只存在旧 `agent-config.json`，服务会自动迁移到同目录的 `server.yaml`
 - 上线前建议先在测试机执行端口连通与客户端联调
 - ACME `--standalone` 需要 80 端口可用且域名已解析到本机；脚本会自动放行 80，失败则回退自签证书
 - `fail2ban` 为 best-effort 安装：无包管理器或安装失败时自动跳过，不中断部署
 - 完整文档站点见 GitHub Pages：<https://neko233-com.github.io/vpn233-provider-server/>（源在 `docs/`）
+- CI 工作流见 [.github/workflows/ci.yml](.github/workflows/ci.yml)
 
 ## License
 

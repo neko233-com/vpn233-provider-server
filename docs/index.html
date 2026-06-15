@@ -88,11 +88,13 @@
     <nav>
       <a href="#features">特性</a>
       <a href="#quickstart">快速开始</a>
+      <a href="#gateway">网关/DNS</a>
       <a href="#perf">性能</a>
       <a href="#nekotls">NekoTLS</a>
       <a href="#protocols">协议</a>
       <a href="#api">API</a>
       <a href="#cli">管理 CLI</a>
+      <a href="agent-first.html">Agent First</a>
       <a href="https://github.com/neko233-com/vpn233-provider-server">GitHub</a>
     </nav>
   </div>
@@ -109,10 +111,11 @@
     </div>
     <h1>一键部署的 <span class="grad">高性能 VPN 节点</span><br>与多目标订阅转换</h1>
     <p class="lead">Agent-first 的 VPN provider 管理端：内置协议能力矩阵、NekoTLS（ECH/Reality 伪装）、
-      超高性能内核调优、安全加固、ACME 证书、自愈看门狗，一条命令落地 sing-box / mihomo 节点。</p>
+      超高性能内核调优、安全加固、ACME 证书、自愈看门狗，以及 <code>server.yaml + proxysss + DNS-01</code> 网关自动化，一条命令落地 sing-box / mihomo 节点。</p>
     <div class="cta">
       <a class="btn primary" href="#quickstart">立即开始</a>
       <a class="btn ghost" href="https://github.com/neko233-com/vpn233-provider-server">查看源码</a>
+      <a class="btn ghost" href="agent-first.html">Agent First 文档</a>
       <a class="btn ghost" href="how-it-work.html">工作原理</a>
     </div>
   </div>
@@ -168,6 +171,48 @@ go run .   <span class="cmt"># http://0.0.0.0:8080/</span></code></pre>
 &amp;enable_acme=true&amp;acme_domain=edge.example.com\
 &amp;selected_protocols=singbox-nekotls,mihomo-nekotls"</span> -o install-node.sh
 sudo bash install-node.sh</code></pre>
+    <p class="sub" style="margin-top:18px">provider 主配置只写 <code>server.yaml</code>；如果旧目录里只有 <code>agent-config.json</code>，启动时会自动迁移。</p>
+  </div>
+</section>
+
+<span class="anchor" id="gateway"></span>
+<section>
+  <div class="wrap">
+    <h2>proxysss 网关 + DNS 自动化</h2>
+    <p class="sub">provider 可直接生成 <code>proxysss.yaml</code> 并通过 proxysss admin API 自动 upsert 路由。</p>
+    <div class="grid c2">
+      <div class="card">
+        <h3>server.yaml 配置块</h3>
+<pre><button class="copy">复制</button><code>proxysss:
+  enabled: true
+  admin_url: "http://127.0.0.1:7777"
+  bearer_token: "change-me"
+  provider_subdomain: "panel"
+  upstream: "http://127.0.0.1:8080"
+
+dns_automation:
+  enabled: true
+  provider: "cloudflare"
+  api_token: "cf-token"
+  email: "ops@example.com"
+  base_domain: "example.com"
+  production: true
+  challenge: "dns01"
+  create_wildcard: true</code></pre>
+      </div>
+      <div class="card">
+        <h3>自动化接口</h3>
+        <ul class="feat">
+          <li><code>GET /api/v1/local/gateway/proxysss.yaml</code>：生成完整网关 YAML</li>
+          <li><code>POST /api/v1/local/gateway/register</code>：调用 proxysss <code>/v1/domain-routes/upsert</code></li>
+          <li>内置 <b>acme_managed + dns01</b>、监控、watchdog、provider 面板域名路由</li>
+        </ul>
+<pre><button class="copy">复制</button><code>curl -s http://127.0.0.1:8080/api/v1/local/gateway/proxysss.yaml -o proxysss.yaml
+proxysss -config ./proxysss.yaml check-config
+proxysss -config ./proxysss.yaml start
+curl -X POST http://127.0.0.1:8080/api/v1/local/gateway/register</code></pre>
+      </div>
+    </div>
   </div>
 </section>
 
@@ -286,6 +331,7 @@ sudo bash install-node.sh</code></pre>
           <li><code>POST /api/v1/generate</code> · <code>GET /generate.sh|.ps1</code></li>
           <li><code>GET /api/v1/subscribe/verify</code></li>
           <li><code>GET /api/v1/subscribe/convert</code></li>
+          <li><code>GET /api/v1/gateway/proxysss.yaml</code> · <code>POST /api/v1/gateway/register</code></li>
           <li><code>GET /repo/status</code> · <code>POST /repo/sync</code></li>
         </ul>
       </div>
@@ -327,6 +373,7 @@ vpn233-node add-block-domain example.com | remove-block-domain example.com</code
   <div class="wrap">
     <p>vpn233-provider-server · MIT License ·
       <a href="https://github.com/neko233-com/vpn233-provider-server">GitHub</a> ·
+      <a href="agent-first.html">Agent First</a> ·
       <a href="how-it-work.html">工作原理</a></p>
     <p style="color:#475569">仅用于合法合规的网络访问与研发联调用途。</p>
   </div>

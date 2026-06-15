@@ -1,0 +1,31 @@
+listen_addr: "0.0.0.0"
+listen_port: 8080
+admin_user: "root"
+admin_password: "root"
+default_data_dir: "/etc/vpn233"
+default_node_ip: ""
+default_port_base: 10000
+default_enable_bbr: true
+default_use_mihomo: true
+default_use_singbox: true
+subscribe_repo_url: "https://github.com/neko233-com/vpn233-subscribe-server.git"
+subscribe_repo_path: "vpn233-subscribe-server"
+subscribe_repo_branch: "main"
+subscribe_verify_token: ""
+proxysss:
+  enabled: false
+  admin_url: "http://127.0.0.1:7777"
+  bearer_token: ""
+  provider_route_name: "vpn233-provider-panel"
+  provider_domain: ""
+  provider_subdomain: "panel"
+  upstream: "http://127.0.0.1:8080"
+dns_automation:
+  enabled: false
+  provider: ""
+  api_token: ""
+  email: ""
+  base_domain: ""
+  production: true
+  challenge: "dns01"
+  create_wildcard: true

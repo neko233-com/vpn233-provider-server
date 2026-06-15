@@ -14,6 +14,18 @@ SUB_REPO_PATH="${VPN233_SUB_REPO_PATH:-vpn233-subscribe-server}"
 SUB_REPO_BRANCH="${VPN233_SUB_REPO_BRANCH:-main}"
 VERIFY_TOKEN="${VPN233_VERIFY_TOKEN:-}"
 GO_VERSION="${VPN233_GO_VERSION:-1.26.0}"
+PROXYSSS_ENABLED="${VPN233_PROXYSSS_ENABLED:-false}"
+PROXYSSS_ADMIN_URL="${VPN233_PROXYSSS_ADMIN_URL:-http://127.0.0.1:7777}"
+PROXYSSS_BEARER_TOKEN="${VPN233_PROXYSSS_BEARER_TOKEN:-}"
+PROXYSSS_PROVIDER_DOMAIN="${VPN233_PROXYSSS_PROVIDER_DOMAIN:-}"
+PROXYSSS_PROVIDER_SUBDOMAIN="${VPN233_PROXYSSS_PROVIDER_SUBDOMAIN:-panel}"
+PROXYSSS_UPSTREAM="${VPN233_PROXYSSS_UPSTREAM:-http://127.0.0.1:8080}"
+DNS_AUTOMATION_ENABLED="${VPN233_DNS_AUTOMATION_ENABLED:-false}"
+DNS_PROVIDER="${VPN233_DNS_PROVIDER:-}"
+DNS_API_TOKEN="${VPN233_DNS_API_TOKEN:-}"
+DNS_EMAIL="${VPN233_DNS_EMAIL:-}"
+DNS_BASE_DOMAIN="${VPN233_DNS_BASE_DOMAIN:-}"
+DNS_CHALLENGE="${VPN233_DNS_CHALLENGE:-dns01}"
 
 if [[ "$EUID" -ne 0 ]]; then
   echo "请使用 root 身份执行"
@@ -89,23 +101,37 @@ sync_repo() {
 }
 
 write_config() {
-  cat >"$INSTALL_DIR/agent-config.json" <<EOF
-{
-  "listen_addr": "${LISTEN_ADDR}",
-  "listen_port": ${LISTEN_PORT},
-  "admin_user": "${ADMIN_USER}",
-  "admin_password": "${ADMIN_PASSWORD}",
-  "default_data_dir": "/etc/vpn233",
-  "default_node_ip": "",
-  "default_port_base": 10000,
-  "default_enable_bbr": true,
-  "default_use_mihomo": true,
-  "default_use_singbox": true,
-  "subscribe_repo_url": "${SUB_REPO_URL}",
-  "subscribe_repo_path": "${SUB_REPO_PATH}",
-  "subscribe_repo_branch": "${SUB_REPO_BRANCH}",
-  "subscribe_verify_token": "${VERIFY_TOKEN}"
-}
+  cat >"$INSTALL_DIR/server.yaml" <<EOF
+listen_addr: "${LISTEN_ADDR}"
+listen_port: ${LISTEN_PORT}
+admin_user: "${ADMIN_USER}"
+admin_password: "${ADMIN_PASSWORD}"
+default_data_dir: "/etc/vpn233"
+default_node_ip: ""
+default_port_base: 10000
+default_enable_bbr: true
+default_use_mihomo: true
+default_use_singbox: true
+subscribe_repo_url: "${SUB_REPO_URL}"
+subscribe_repo_path: "${SUB_REPO_PATH}"
+subscribe_repo_branch: "${SUB_REPO_BRANCH}"
+subscribe_verify_token: "${VERIFY_TOKEN}"
+proxysss:
+  enabled: ${PROXYSSS_ENABLED}
+  admin_url: "${PROXYSSS_ADMIN_URL}"
+  bearer_token: "${PROXYSSS_BEARER_TOKEN}"
+  provider_domain: "${PROXYSSS_PROVIDER_DOMAIN}"
+  provider_subdomain: "${PROXYSSS_PROVIDER_SUBDOMAIN}"
+  upstream: "${PROXYSSS_UPSTREAM}"
+dns_automation:
+  enabled: ${DNS_AUTOMATION_ENABLED}
+  provider: "${DNS_PROVIDER}"
+  api_token: "${DNS_API_TOKEN}"
+  email: "${DNS_EMAIL}"
+  base_domain: "${DNS_BASE_DOMAIN}"
+  production: true
+  challenge: "${DNS_CHALLENGE}"
+  create_wildcard: true
 EOF
 }
 
@@ -129,7 +155,7 @@ After=network.target
 [Service]
 Type=simple
 WorkingDirectory=$INSTALL_DIR
-Environment=VPN233_CONFIG_PATH=$INSTALL_DIR/agent-config.json
+Environment=VPN233_CONFIG_PATH=$INSTALL_DIR/server.yaml
 ExecStart=$INSTALL_DIR/vpn233-provider-server
 Restart=always
 RestartSec=2
@@ -176,10 +202,16 @@ case "\${1:-help}" in
     command -v journalctl >/dev/null 2>&1 && journalctl -u vpn233-provider-server -n 100 --no-pager || tail -n 100 /var/log/vpn233-provider-server.log
     ;;
   config)
-    cat "\$INSTALL_DIR/agent-config.json"
+    cat "\$INSTALL_DIR/server.yaml"
     ;;
   health)
     curl -fsSL "\$BASE_URL/api/v1/health"
+    ;;
+  gateway-plan)
+    curl -fsSL "\$BASE_URL/api/v1/local/gateway/proxysss.yaml"
+    ;;
+  gateway-register)
+    curl -fsSL -X POST "\$BASE_URL/api/v1/local/gateway/register"
     ;;
   repo-status)
     TOKEN="\${2:-}"
@@ -193,6 +225,8 @@ vpn233-provider restart
 vpn233-provider logs
 vpn233-provider config
 vpn233-provider health
+vpn233-provider gateway-plan
+vpn233-provider gateway-register
 vpn233-provider repo-status <token>
 USAGE
     ;;

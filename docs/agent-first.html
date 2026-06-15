@@ -1,0 +1,145 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>vpn233-provider-server · Agent First 文档</title>
+<meta name="description" content="vpn233-provider-server 的 Agent First 操作面：server.yaml、CLI、本地 HTTP、proxysss 网关计划与自动注册。">
+<style>
+  :root{--bg:#0b1120;--card:#121b30;--border:#26324a;--fg:#e2e8f0;--muted:#94a3b8;--accent:#60a5fa;--accent2:#22c55e;--code:#0a1020}
+  *{box-sizing:border-box} body{margin:0;background:linear-gradient(180deg,#0b1120,#0d1426 60%,#0b1120);color:var(--fg);font-family:"Inter","PingFang SC","Microsoft YaHei",system-ui,Arial,sans-serif;line-height:1.7}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  code,pre{font-family:ui-monospace,Consolas,monospace}
+  .wrap{max-width:980px;margin:0 auto;padding:28px 20px 56px}
+  .top{display:flex;gap:12px;align-items:center;justify-content:space-between;flex-wrap:wrap}
+  .title{font-size:34px;font-weight:800;margin:0}.sub{color:var(--muted);margin:8px 0 0}
+  .card{background:var(--card);border:1px solid var(--border);border-radius:16px;padding:20px;margin-top:18px}
+  h2{margin:0 0 10px;font-size:24px} h3{margin:0 0 10px;font-size:18px}
+  pre{background:var(--code);border:1px solid var(--border);border-radius:12px;padding:15px;overflow:auto;font-size:13.5px}
+  ul{margin:0;padding-left:18px} li{margin:6px 0;color:var(--muted)} li b{color:var(--fg)}
+  table{width:100%;border-collapse:collapse;border:1px solid var(--border);border-radius:12px;overflow:hidden;font-size:13.5px}
+  th,td{padding:10px 12px;border-bottom:1px solid var(--border);text-align:left} th{background:#16213b} td{color:var(--muted)} tr:last-child td{border-bottom:none}
+  .badge{display:inline-block;border:1px solid var(--border);padding:3px 10px;border-radius:999px;font-size:12px;color:var(--muted);margin-right:8px}
+  .ok{color:var(--accent2)}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <div>
+      <p class="title">Agent First 文档</p>
+      <p class="sub">围绕 <code>server.yaml</code>、本地免登录接口、CLI、以及 proxysss 网关自动化的控制面说明。</p>
+    </div>
+    <div>
+      <a href="index.html">返回主页</a>
+    </div>
+  </div>
+
+  <div class="card">
+    <span class="badge">单文件配置</span>
+    <span class="badge">本地 API</span>
+    <span class="badge">proxysss</span>
+    <span class="badge">DNS-01</span>
+    <h2>1. 配置原则</h2>
+    <ul>
+      <li><b>唯一主配置</b>：provider 现在只写 <code>server.yaml</code>；旧的 <code>agent-config.json</code> 仅作为一次性迁移输入。</li>
+      <li><b>Agent inspectability</b>：本地接口全部是 JSON 或纯文本/YAML，避免多文件 include 与隐式状态。</li>
+      <li><b>Gateway as code</b>：proxysss 网关计划可直接生成 YAML，也可通过 admin API 一键注册路由。</li>
+    </ul>
+  </div>
+
+  <div class="card">
+    <h2>2. server.yaml</h2>
+<pre><code>listen_addr: "0.0.0.0"
+listen_port: 8080
+admin_user: "root"
+admin_password: "root"
+
+default_data_dir: "/etc/vpn233"
+default_port_base: 10000
+default_enable_bbr: true
+default_use_mihomo: true
+default_use_singbox: true
+
+subscribe_repo_url: "https://github.com/neko233-com/vpn233-subscribe-server.git"
+subscribe_repo_path: "vpn233-subscribe-server"
+subscribe_repo_branch: "main"
+subscribe_verify_token: ""
+
+proxysss:
+  enabled: true
+  admin_url: "http://127.0.0.1:7777"
+  bearer_token: "change-me"
+  provider_route_name: "vpn233-provider-panel"
+  provider_subdomain: "panel"
+  upstream: "http://127.0.0.1:8080"
+
+dns_automation:
+  enabled: true
+  provider: "cloudflare"
+  api_token: "cf-token"
+  email: "ops@example.com"
+  base_domain: "example.com"
+  production: true
+  challenge: "dns01"
+  create_wildcard: true</code></pre>
+  </div>
+
+  <div class="card">
+    <h2>3. 本地 Agent API</h2>
+    <p class="sub">以下接口仅允许 <code>127.0.0.1</code> / <code>::1</code> 访问，适合本机 Agent/脚本编排。</p>
+    <table>
+      <thead><tr><th>接口</th><th>输出</th><th>用途</th></tr></thead>
+      <tbody>
+        <tr><td><code>GET /api/v1/local/config</code></td><td>JSON</td><td>读取当前 <code>server.yaml</code> 生效配置</td></tr>
+        <tr><td><code>GET /api/v1/local/protocols</code></td><td>JSON</td><td>协议能力矩阵</td></tr>
+        <tr><td><code>GET /api/v1/local/generate.sh</code></td><td>Shell</td><td>节点安装脚本</td></tr>
+        <tr><td><code>GET /api/v1/local/subscribe/convert</code></td><td>YAML/JSON/TXT</td><td>订阅转换</td></tr>
+        <tr><td><code>GET /api/v1/local/gateway/proxysss.yaml</code></td><td>YAML</td><td>生成 proxysss 网关 + DNS-01 ACME 配置</td></tr>
+        <tr><td><code>POST /api/v1/local/gateway/register</code></td><td>JSON</td><td>向 proxysss admin API 自动注册 provider 路由</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <div class="card">
+    <h2>4. CLI 对应面</h2>
+<pre><code>go run . config get
+go run . config set --proxysss-enabled=true --dns-enabled=true \
+  --dns-provider=cloudflare --dns-api-token=cf-token \
+  --dns-email=ops@example.com --dns-base-domain=example.com
+
+go run . gateway-plan
+go run . gateway-register
+
+go run . generate --format sh --node-ip edge.example.com \
+  --enable-acme=true --acme-domain=edge.example.com \
+  --protocols=singbox-nekotls,mihomo-nekotls</code></pre>
+  </div>
+
+  <div class="card">
+    <h2>5. proxysss 自动化流</h2>
+    <ul>
+      <li><b>步骤 1</b>：在 <code>server.yaml</code> 打开 <code>proxysss.enabled</code> 与 <code>dns_automation.enabled</code>。</li>
+      <li><b>步骤 2</b>：用 <code>GET /api/v1/local/gateway/proxysss.yaml</code> 生成完整 gateway YAML。该 YAML 已包含 <code>acme_managed + dns01</code>、监控、watchdog、以及 provider 面板域名路由。</li>
+      <li><b>步骤 3</b>：将该 YAML 交给 proxysss：<code>proxysss -config ./proxysss.yaml check-config</code>，再启动或热重载。</li>
+      <li><b>步骤 4</b>：如果 proxysss 已运行并开启了 <code>admin.enable_write_ops</code>，直接调用 <code>POST /api/v1/local/gateway/register</code> 自动 upsert 路由。</li>
+    </ul>
+<pre><code>curl -s http://127.0.0.1:8080/api/v1/local/gateway/proxysss.yaml -o proxysss.yaml
+proxysss -config ./proxysss.yaml check-config
+proxysss -config ./proxysss.yaml start
+
+curl -X POST http://127.0.0.1:8080/api/v1/local/gateway/register</code></pre>
+  </div>
+
+  <div class="card">
+    <h2>6. 验证闭环</h2>
+    <ul>
+      <li><b>单测</b>：YAML 迁移、gateway YAML 生成、proxysss admin route register</li>
+      <li><b>语法</b>：<code>bash -n</code> 校验外层安装器与内嵌 <code>vpn233-node</code> CLI</li>
+      <li><b>端到端</b>：<code>scripts/verify.sh</code> / <code>scripts/verify.ps1</code> 会额外校验 gateway YAML 含 <code>challenge: dns01</code> / <code>provider: cloudflare</code></li>
+      <li><b>CI</b>：GitHub Actions 在 Ubuntu / Windows 运行完整测试与 verify 脚本，发布后可用 <code>gh run watch</code> 验证</li>
+    </ul>
+  </div>
+</div>
+</body>
+</html>

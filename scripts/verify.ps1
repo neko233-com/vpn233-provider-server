@@ -8,9 +8,9 @@ $rootDir = Split-Path -Parent $PSScriptRoot
 $workDir = Join-Path $env:TEMP ("vpn233-verify-" + [guid]::NewGuid().ToString("N"))
 New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
-$cfgPath = Join-Path $workDir "agent-config.json"
-$origCfg = Join-Path $rootDir "agent-config.json"
-$bakCfg = Join-Path $workDir "agent-config.bak.json"
+$cfgPath = Join-Path $workDir "server.yaml"
+$origCfg = Join-Path $rootDir "server.yaml"
+$bakCfg = Join-Path $workDir "server.bak.yaml"
 
 function Get-FreeTcpPort {
     $listener = [System.Net.Sockets.TcpListener]::new([System.Net.IPAddress]::Loopback, 0)
@@ -24,25 +24,39 @@ if (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction SilentlyCon
     $Port = Get-FreeTcpPort
 }
 
-$config = @{
-    listen_addr = "127.0.0.1"
-    listen_port = $Port
-    admin_user = "root"
-    admin_password = "root"
-    default_data_dir = "/tmp/vpn233"
-    default_node_ip = ""
-    default_port_base = 10000
-    default_enable_bbr = $true
-    default_use_mihomo = $false
-    default_use_singbox = $true
-    subscribe_repo_url = "https://github.com/neko233-com/vpn233-subscribe-server.git"
-    subscribe_repo_path = "vpn233-subscribe-server"
-    subscribe_repo_branch = "main"
-    subscribe_verify_token = $VerifyToken
-}
-$json = $config | ConvertTo-Json -Depth 3
+$yaml = @"
+listen_addr: "127.0.0.1"
+listen_port: $Port
+admin_user: "root"
+admin_password: "root"
+default_data_dir: "/tmp/vpn233"
+default_node_ip: ""
+default_port_base: 10000
+default_enable_bbr: true
+default_use_mihomo: false
+default_use_singbox: true
+subscribe_repo_url: "https://github.com/neko233-com/vpn233-subscribe-server.git"
+subscribe_repo_path: "vpn233-subscribe-server"
+subscribe_repo_branch: "main"
+subscribe_verify_token: "$VerifyToken"
+proxysss:
+    enabled: true
+    admin_url: "http://127.0.0.1:7777"
+    bearer_token: "proxysss-test-token"
+    provider_subdomain: "panel"
+    upstream: "http://127.0.0.1:$Port"
+dns_automation:
+    enabled: true
+    provider: "cloudflare"
+    api_token: "cf-test-token"
+    email: "ops@example.com"
+    base_domain: "example.com"
+    production: true
+    challenge: "dns01"
+    create_wildcard: true
+"@
 $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-[System.IO.File]::WriteAllText($cfgPath, $json, $utf8NoBom)
+[System.IO.File]::WriteAllText($cfgPath, $yaml, $utf8NoBom)
 
 if (Test-Path -Path $origCfg) {
     Copy-Item -Path $origCfg -Destination $bakCfg -Force
@@ -122,6 +136,15 @@ try {
         }
     }
     Write-Host "[verify] node generation features ok"
+
+    Write-Host "[verify] proxysss gateway yaml"
+    $gateway = Invoke-RestMethod -Uri "$base/api/v1/local/gateway/proxysss.yaml" -Method Get
+    foreach ($kw in @("challenge: dns01", "provider: cloudflare", "name: vpn233-provider-panel")) {
+        if ("$gateway" -notmatch [regex]::Escape($kw)) {
+            throw "proxysss gateway plan missing $kw"
+        }
+    }
+    Write-Host "[verify] proxysss gateway yaml ok"
 
     Write-Host "[verify] done"
 } finally {

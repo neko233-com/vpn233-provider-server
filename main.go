@@ -29,20 +29,22 @@ import (
 )
 
 type ServerConfig struct {
-	ListenAddr           string `json:"listen_addr"`
-	ListenPort           int    `json:"listen_port"`
-	AdminUser            string `json:"admin_user"`
-	AdminPassword        string `json:"admin_password"`
-	DefaultDataDir       string `json:"default_data_dir"`
-	DefaultNodeIP        string `json:"default_node_ip"`
-	DefaultPortBase      int    `json:"default_port_base"`
-	DefaultEnableBBR     bool   `json:"default_enable_bbr"`
-	DefaultUseMihomo     bool   `json:"default_use_mihomo"`
-	DefaultUseSingbox    bool   `json:"default_use_singbox"`
-	SubscribeRepoURL     string `json:"subscribe_repo_url"`
-	SubscribeRepoPath    string `json:"subscribe_repo_path"`
-	SubscribeRepoBranch  string `json:"subscribe_repo_branch"`
-	SubscribeVerifyToken string `json:"subscribe_verify_token"`
+	ListenAddr           string               `json:"listen_addr" yaml:"listen_addr"`
+	ListenPort           int                  `json:"listen_port" yaml:"listen_port"`
+	AdminUser            string               `json:"admin_user" yaml:"admin_user"`
+	AdminPassword        string               `json:"admin_password" yaml:"admin_password"`
+	DefaultDataDir       string               `json:"default_data_dir" yaml:"default_data_dir"`
+	DefaultNodeIP        string               `json:"default_node_ip" yaml:"default_node_ip"`
+	DefaultPortBase      int                  `json:"default_port_base" yaml:"default_port_base"`
+	DefaultEnableBBR     bool                 `json:"default_enable_bbr" yaml:"default_enable_bbr"`
+	DefaultUseMihomo     bool                 `json:"default_use_mihomo" yaml:"default_use_mihomo"`
+	DefaultUseSingbox    bool                 `json:"default_use_singbox" yaml:"default_use_singbox"`
+	SubscribeRepoURL     string               `json:"subscribe_repo_url" yaml:"subscribe_repo_url"`
+	SubscribeRepoPath    string               `json:"subscribe_repo_path" yaml:"subscribe_repo_path"`
+	SubscribeRepoBranch  string               `json:"subscribe_repo_branch" yaml:"subscribe_repo_branch"`
+	SubscribeVerifyToken string               `json:"subscribe_verify_token" yaml:"subscribe_verify_token"`
+	ProxySSS             ProxySSSGatewayConfig `json:"proxysss" yaml:"proxysss"`
+	DNSAutomation        DNSAutomationConfig  `json:"dns_automation" yaml:"dns_automation"`
 }
 
 type ProtocolCatalog struct {
@@ -349,7 +351,7 @@ func newAppState() (*AppState, error) {
 	if err := state.loadConfig(); err != nil {
 		return nil, err
 	}
-	state.cfg = normalizeRepoDefaults(state.cfg)
+	state.cfg = applyServerConfigDefaults(state.cfg)
 	return state, nil
 }
 
@@ -379,6 +381,8 @@ func buildMux(state *AppState) *http.ServeMux {
 	mux.HandleFunc("/api/v1/repo/sync", state.auth(state.repoSyncHandler))
 	mux.HandleFunc("/api/v1/subscribe/verify", state.subscribeVerifyHandler)
 	mux.HandleFunc("/api/v1/subscribe/convert", state.subscribeConvertHandler)
+	mux.HandleFunc("/api/v1/gateway/proxysss.yaml", state.auth(state.proxySSSGatewayYAMLHandler))
+	mux.HandleFunc("/api/v1/gateway/register", state.auth(state.proxySSSRegisterHandler))
 
 	mux.HandleFunc("/api/v1/local/health", state.localOnly(state.healthHandler))
 	mux.HandleFunc("/api/v1/local/protocols", state.localOnly(state.protocolListHandler))
@@ -389,6 +393,8 @@ func buildMux(state *AppState) *http.ServeMux {
 	mux.HandleFunc("/api/v1/local/repo/status", state.localOnly(state.repoStatusHandler))
 	mux.HandleFunc("/api/v1/local/repo/sync", state.localOnly(state.repoSyncHandler))
 	mux.HandleFunc("/api/v1/local/subscribe/convert", state.localOnly(state.subscribeConvertHandler))
+	mux.HandleFunc("/api/v1/local/gateway/proxysss.yaml", state.localOnly(state.proxySSSGatewayYAMLHandler))
+	mux.HandleFunc("/api/v1/local/gateway/register", state.localOnly(state.proxySSSRegisterHandler))
 	return mux
 }
 
@@ -410,6 +416,10 @@ func runCLI(state *AppState, stdout io.Writer, args []string) error {
 		return runCLIConfigSet(state, stdout, args[1:])
 	case "generate":
 		return runCLIGenerate(state, stdout, args[1:])
+	case "gateway-plan":
+		return runCLIGatewayPlan(state, stdout)
+	case "gateway-register":
+		return runCLIGatewayRegister(state, stdout)
 	default:
 		return fmt.Errorf("unknown command %q\n\n%s", args[0], cliUsageText())
 	}
@@ -450,13 +460,27 @@ func runCLIConfigSet(state *AppState, stdout io.Writer, args []string) error {
 	repoPath := fs.String("repo-path", "", "subscribe repo path")
 	repoBranch := fs.String("repo-branch", "", "subscribe repo branch")
 	repoVerifyToken := fs.String("repo-verify-token", "", "subscribe verify token")
+	proxySSSAdminURL := fs.String("proxysss-admin-url", "", "proxysss admin API URL")
+	proxySSSBearerToken := fs.String("proxysss-bearer-token", "", "proxysss admin API bearer token")
+	proxySSSProviderDomain := fs.String("proxysss-provider-domain", "", "public provider domain exposed by proxysss")
+	proxySSSProviderSubdomain := fs.String("proxysss-provider-subdomain", "", "provider subdomain under dns base domain")
+	proxySSSUpstream := fs.String("proxysss-upstream", "", "proxysss upstream URL for provider panel")
+	dnsProvider := fs.String("dns-provider", "", "DNS provider for proxysss managed ACME")
+	dnsToken := fs.String("dns-api-token", "", "DNS provider API token")
+	dnsEmail := fs.String("dns-email", "", "DNS/ACME email")
+	dnsBaseDomain := fs.String("dns-base-domain", "", "base domain for wildcard/provider routes")
+	dnsChallenge := fs.String("dns-challenge", "", "ACME challenge type (dns01|http01|tls_alpn01)")
 
 	var defaultEnableBBR optionalBool
 	var defaultUseMihomo optionalBool
 	var defaultUseSingbox optionalBool
+	var proxySSSEnabled optionalBool
+	var dnsEnabled optionalBool
 	fs.Var(&defaultEnableBBR, "default-enable-bbr", "default BBR toggle")
 	fs.Var(&defaultUseMihomo, "default-use-mihomo", "default Mihomo toggle")
 	fs.Var(&defaultUseSingbox, "default-use-singbox", "default sing-box toggle")
+	fs.Var(&proxySSSEnabled, "proxysss-enabled", "enable proxysss gateway integration")
+	fs.Var(&dnsEnabled, "dns-enabled", "enable DNS-01 automation for proxysss")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -496,6 +520,42 @@ func runCLIConfigSet(state *AppState, stdout io.Writer, args []string) error {
 	if *repoVerifyToken != "" {
 		state.cfg.SubscribeVerifyToken = *repoVerifyToken
 	}
+	if proxySSSEnabled.set {
+		state.cfg.ProxySSS.Enabled = proxySSSEnabled.value
+	}
+	if *proxySSSAdminURL != "" {
+		state.cfg.ProxySSS.AdminURL = *proxySSSAdminURL
+	}
+	if *proxySSSBearerToken != "" {
+		state.cfg.ProxySSS.BearerToken = *proxySSSBearerToken
+	}
+	if *proxySSSProviderDomain != "" {
+		state.cfg.ProxySSS.ProviderDomain = *proxySSSProviderDomain
+	}
+	if *proxySSSProviderSubdomain != "" {
+		state.cfg.ProxySSS.ProviderSubdomain = *proxySSSProviderSubdomain
+	}
+	if *proxySSSUpstream != "" {
+		state.cfg.ProxySSS.Upstream = *proxySSSUpstream
+	}
+	if dnsEnabled.set {
+		state.cfg.DNSAutomation.Enabled = dnsEnabled.value
+	}
+	if *dnsProvider != "" {
+		state.cfg.DNSAutomation.Provider = *dnsProvider
+	}
+	if *dnsToken != "" {
+		state.cfg.DNSAutomation.APIToken = *dnsToken
+	}
+	if *dnsEmail != "" {
+		state.cfg.DNSAutomation.Email = *dnsEmail
+	}
+	if *dnsBaseDomain != "" {
+		state.cfg.DNSAutomation.BaseDomain = *dnsBaseDomain
+	}
+	if *dnsChallenge != "" {
+		state.cfg.DNSAutomation.Challenge = *dnsChallenge
+	}
 	if defaultEnableBBR.set {
 		state.cfg.DefaultEnableBBR = defaultEnableBBR.value
 	}
@@ -505,7 +565,7 @@ func runCLIConfigSet(state *AppState, stdout io.Writer, args []string) error {
 	if defaultUseSingbox.set {
 		state.cfg.DefaultUseSingbox = defaultUseSingbox.value
 	}
-	state.cfg = normalizeRepoDefaults(state.cfg)
+	state.cfg = applyServerConfigDefaults(state.cfg)
 	updated := state.cfg
 	state.mu.Unlock()
 
@@ -675,6 +735,8 @@ Usage:
   vpn233-provider-server config set [flags]
   vpn233-provider-server config-set [flags]
   vpn233-provider-server generate --node-ip <ip> [flags]
+	vpn233-provider-server gateway-plan
+	vpn233-provider-server gateway-register
 
 Examples:
   vpn233-provider-server protocols
@@ -751,17 +813,7 @@ func isLoopbackRemote(remoteAddr string) bool {
 }
 
 func resolveConfigPath() string {
-	if raw := strings.TrimSpace(os.Getenv("VPN233_CONFIG_PATH")); raw != "" {
-		return raw
-	}
-	exePath, err := os.Executable()
-	if err == nil {
-		candidate := filepath.Join(filepath.Dir(exePath), "agent-config.json")
-		if _, statErr := os.Stat(candidate); statErr == nil {
-			return candidate
-		}
-	}
-	return "agent-config.json"
+	return resolveServerConfigPath()
 }
 
 func defaultConfig() ServerConfig {
@@ -776,40 +828,33 @@ func defaultConfig() ServerConfig {
 		DefaultEnableBBR:  true,
 		DefaultUseMihomo:  false,
 		DefaultUseSingbox: true,
+		ProxySSS: ProxySSSGatewayConfig{
+			AdminURL:          "http://127.0.0.1:7777",
+			ProviderRouteName: "vpn233-provider-panel",
+			ProviderSubdomain: "panel",
+			Upstream:          "http://127.0.0.1:8080",
+		},
+		DNSAutomation: DNSAutomationConfig{
+			Production:     true,
+			Challenge:      "dns01",
+			CreateWildcard: true,
+		},
 	}
 	return normalizeRepoDefaults(cfg)
 }
 
 func (a *AppState) loadConfig() error {
-	b, err := os.ReadFile(a.cfgPath)
+	next, migrated, err := loadServerConfig(a.cfgPath)
 	if err != nil {
 		if os.IsNotExist(err) {
+			a.cfg = defaultConfig()
 			return a.saveConfig()
 		}
 		return err
 	}
-	var next ServerConfig
-	if err := json.Unmarshal(b, &next); err != nil {
-		return err
-	}
-	a.cfg = normalizeRepoDefaults(next)
-	if a.cfg.AdminUser == "" {
-		a.cfg.AdminUser = "root"
-	}
-	if a.cfg.AdminPassword == "" {
-		a.cfg.AdminPassword = "root"
-	}
-	if a.cfg.ListenPort == 0 {
-		a.cfg.ListenPort = 8080
-	}
-	if a.cfg.ListenAddr == "" {
-		a.cfg.ListenAddr = "0.0.0.0"
-	}
-	if a.cfg.DefaultDataDir == "" {
-		a.cfg.DefaultDataDir = "/etc/vpn233"
-	}
-	if a.cfg.DefaultPortBase <= 0 {
-		a.cfg.DefaultPortBase = 10000
+	a.cfg = next
+	if migrated {
+		return a.saveConfig()
 	}
 	return nil
 }
@@ -818,12 +863,7 @@ func (a *AppState) saveConfig() error {
 	a.mu.RLock()
 	payload := a.cfg
 	a.mu.RUnlock()
-	raw, _ := json.MarshalIndent(payload, "", "  ")
-	tmp := a.cfgPath + ".tmp"
-	if err := os.WriteFile(tmp, raw, 0o644); err != nil {
-		return err
-	}
-	return os.Rename(tmp, a.cfgPath)
+	return saveServerConfig(a.cfgPath, payload)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -976,26 +1016,20 @@ func (a *AppState) configHandler(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		a.mu.RLock()
 		defer a.mu.RUnlock()
-		response := map[string]any{
-			"node_name_default":      "vpn233-node",
-			"listen_addr":            a.cfg.ListenAddr,
-			"listen_port":            a.cfg.ListenPort,
-			"admin_user":             a.cfg.AdminUser,
-			"subscribe_repo_url":     a.cfg.SubscribeRepoURL,
-			"subscribe_repo_path":    a.cfg.SubscribeRepoPath,
-			"subscribe_repo_branch":  a.cfg.SubscribeRepoBranch,
-			"subscribe_verify_token": a.cfg.SubscribeVerifyToken,
-			"default_data_dir":       a.cfg.DefaultDataDir,
-			"default_node_ip":        a.cfg.DefaultNodeIP,
-			"default_port_base":      a.cfg.DefaultPortBase,
-			"default_enable_bbr":     a.cfg.DefaultEnableBBR,
-			"default_use_mihomo":     a.cfg.DefaultUseMihomo,
-			"default_use_singbox":    a.cfg.DefaultUseSingbox,
-		}
-		writeJSON(w, http.StatusOK, response)
+		writeJSON(w, http.StatusOK, configResponse(a.cfg, a.cfgPath))
 	case http.MethodPost:
+		rawBody, err := io.ReadAll(r.Body)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad request"})
+			return
+		}
 		var body ServerConfig
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+		if err := json.Unmarshal(rawBody, &body); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad request"})
+			return
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal(rawBody, &raw); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]any{"error": "bad request"})
 			return
 		}
@@ -1033,10 +1067,22 @@ func (a *AppState) configHandler(w http.ResponseWriter, r *http.Request) {
 		if body.DefaultPortBase > 0 {
 			a.cfg.DefaultPortBase = body.DefaultPortBase
 		}
-		a.cfg.DefaultEnableBBR = body.DefaultEnableBBR
-		a.cfg.DefaultUseMihomo = body.DefaultUseMihomo
-		a.cfg.DefaultUseSingbox = body.DefaultUseSingbox
-		a.cfg = normalizeRepoDefaults(a.cfg)
+		if _, ok := raw["proxysss"]; ok {
+			a.cfg.ProxySSS = body.ProxySSS
+		}
+		if _, ok := raw["dns_automation"]; ok {
+			a.cfg.DNSAutomation = body.DNSAutomation
+		}
+		if _, ok := raw["default_enable_bbr"]; ok {
+			a.cfg.DefaultEnableBBR = body.DefaultEnableBBR
+		}
+		if _, ok := raw["default_use_mihomo"]; ok {
+			a.cfg.DefaultUseMihomo = body.DefaultUseMihomo
+		}
+		if _, ok := raw["default_use_singbox"]; ok {
+			a.cfg.DefaultUseSingbox = body.DefaultUseSingbox
+		}
+		a.cfg = applyServerConfigDefaults(a.cfg)
 		a.mu.Unlock()
 		if err := a.saveConfig(); err != nil {
 			writeJSON(w, http.StatusInternalServerError, map[string]any{"error": "save failed"})
@@ -1186,8 +1232,11 @@ func (a *AppState) subscribeVerifyHandler(w http.ResponseWriter, r *http.Request
 		"service":           "vpn233-provider-server",
 		"version":           "1.1.0",
 		"git_root":          ctx.TopLevel,
+		"config_path":       a.cfgPath,
+		"config_format":     defaultServerConfigFile,
 		"protocols":         protocolCatalog,
 		"subscribe_targets": subscribeTargets(),
+		"gateway_endpoints": []string{"/api/v1/gateway/proxysss.yaml", "/api/v1/gateway/register"},
 		"repo_state": map[string]any{
 			"path":   result.RepoPath,
 			"url":    result.RepoURL,

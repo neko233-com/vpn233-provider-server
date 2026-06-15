@@ -10,7 +10,19 @@ param(
     [string]$SubRepoPath = $env:VPN233_SUB_REPO_PATH,
     [string]$SubRepoBranch = $env:VPN233_SUB_REPO_BRANCH,
     [string]$VerifyToken = $env:VPN233_VERIFY_TOKEN,
-    [string]$GoVersion = $env:VPN233_GO_VERSION
+    [string]$GoVersion = $env:VPN233_GO_VERSION,
+    [string]$ProxySSSEnabledRaw = $env:VPN233_PROXYSSS_ENABLED,
+    [string]$ProxySSSAdminUrl = $env:VPN233_PROXYSSS_ADMIN_URL,
+    [string]$ProxySSSBearerToken = $env:VPN233_PROXYSSS_BEARER_TOKEN,
+    [string]$ProxySSSProviderDomain = $env:VPN233_PROXYSSS_PROVIDER_DOMAIN,
+    [string]$ProxySSSProviderSubdomain = $env:VPN233_PROXYSSS_PROVIDER_SUBDOMAIN,
+    [string]$ProxySSSUpstream = $env:VPN233_PROXYSSS_UPSTREAM,
+    [string]$DNSAutomationEnabledRaw = $env:VPN233_DNS_AUTOMATION_ENABLED,
+    [string]$DNSProvider = $env:VPN233_DNS_PROVIDER,
+    [string]$DNSApiToken = $env:VPN233_DNS_API_TOKEN,
+    [string]$DNSEmail = $env:VPN233_DNS_EMAIL,
+    [string]$DNSBaseDomain = $env:VPN233_DNS_BASE_DOMAIN,
+    [string]$DNSChallenge = $env:VPN233_DNS_CHALLENGE
 )
 
 $ErrorActionPreference = "Stop"
@@ -25,6 +37,14 @@ if (-not $SubRepoUrl) { $SubRepoUrl = "https://github.com/neko233-com/vpn233-sub
 if (-not $SubRepoPath) { $SubRepoPath = "vpn233-subscribe-server" }
 if (-not $SubRepoBranch) { $SubRepoBranch = "main" }
 if (-not $GoVersion) { $GoVersion = "1.26.0" }
+if (-not $ProxySSSEnabledRaw) { $ProxySSSEnabledRaw = "False" }
+if (-not $DNSAutomationEnabledRaw) { $DNSAutomationEnabledRaw = "False" }
+if (-not $ProxySSSAdminUrl) { $ProxySSSAdminUrl = "http://127.0.0.1:7777" }
+if (-not $ProxySSSProviderSubdomain) { $ProxySSSProviderSubdomain = "panel" }
+if (-not $ProxySSSUpstream) { $ProxySSSUpstream = "http://127.0.0.1:8080" }
+if (-not $DNSChallenge) { $DNSChallenge = "dns01" }
+$ProxySSSEnabled = [System.Convert]::ToBoolean($ProxySSSEnabledRaw)
+$DNSAutomationEnabled = [System.Convert]::ToBoolean($DNSAutomationEnabledRaw)
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "请使用管理员运行 PowerShell"
@@ -74,25 +94,40 @@ function Sync-Repo {
 }
 
 function Write-ConfigFile {
-    $config = @{
-        listen_addr = $ListenAddr
-        listen_port = $ListenPort
-        admin_user = $AdminUser
-        admin_password = $AdminPassword
-        default_data_dir = "/etc/vpn233"
-        default_node_ip = ""
-        default_port_base = 10000
-        default_enable_bbr = $true
-        default_use_mihomo = $true
-        default_use_singbox = $true
-        subscribe_repo_url = $SubRepoUrl
-        subscribe_repo_path = $SubRepoPath
-        subscribe_repo_branch = $SubRepoBranch
-        subscribe_verify_token = $VerifyToken
-    }
-    $json = $config | ConvertTo-Json -Depth 4
+        $yaml = @"
+listen_addr: "$ListenAddr"
+listen_port: $ListenPort
+admin_user: "$AdminUser"
+admin_password: "$AdminPassword"
+default_data_dir: "/etc/vpn233"
+default_node_ip: ""
+default_port_base: 10000
+default_enable_bbr: true
+default_use_mihomo: true
+default_use_singbox: true
+subscribe_repo_url: "$SubRepoUrl"
+subscribe_repo_path: "$SubRepoPath"
+subscribe_repo_branch: "$SubRepoBranch"
+subscribe_verify_token: "$VerifyToken"
+proxysss:
+    enabled: $($ProxySSSEnabled.ToString().ToLowerInvariant())
+    admin_url: "$ProxySSSAdminUrl"
+    bearer_token: "$ProxySSSBearerToken"
+    provider_domain: "$ProxySSSProviderDomain"
+    provider_subdomain: "$ProxySSSProviderSubdomain"
+    upstream: "$ProxySSSUpstream"
+dns_automation:
+    enabled: $($DNSAutomationEnabled.ToString().ToLowerInvariant())
+    provider: "$DNSProvider"
+    api_token: "$DNSApiToken"
+    email: "$DNSEmail"
+    base_domain: "$DNSBaseDomain"
+    production: true
+    challenge: "$DNSChallenge"
+    create_wildcard: true
+"@
     $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
-    [System.IO.File]::WriteAllText((Join-Path $InstallDir "agent-config.json"), $json, $utf8NoBom)
+        [System.IO.File]::WriteAllText((Join-Path $InstallDir "server.yaml"), $yaml, $utf8NoBom)
 }
 
 function Build-App {
@@ -129,8 +164,10 @@ param(
 switch (`$args[0]) {
     "status" { Get-Service -Name "vpn233-provider-server" }
     "restart" { Restart-Service -Name "vpn233-provider-server" -Force }
-    "config" { Get-Content -Raw (Join-Path "$InstallDir" "agent-config.json") }
+    "config" { Get-Content -Raw (Join-Path "$InstallDir" "server.yaml") }
     "health" { Invoke-RestMethod -Uri "`$base/api/v1/health" -Method Get | Out-Host }
+    "gateway-plan" { Invoke-RestMethod -Uri "`$base/api/v1/local/gateway/proxysss.yaml" -Method Get | Out-Host }
+    "gateway-register" { Invoke-RestMethod -Uri "`$base/api/v1/local/gateway/register" -Method Post | Out-Host }
     "repo-status" {
         if (-not `$Token) { throw "usage: .\vpn233-provider.ps1 repo-status -Token <token>" }
         Invoke-RestMethod -Uri "`$base/api/v1/repo/status" -Method Get -Headers @{ Authorization = "Bearer `$Token" } | Out-Host
@@ -140,6 +177,8 @@ switch (`$args[0]) {
         Write-Host "vpn233-provider.ps1 restart"
         Write-Host "vpn233-provider.ps1 config"
         Write-Host "vpn233-provider.ps1 health"
+        Write-Host "vpn233-provider.ps1 gateway-plan"
+        Write-Host "vpn233-provider.ps1 gateway-register"
         Write-Host "vpn233-provider.ps1 repo-status -Token <token>"
     }
 }
