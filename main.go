@@ -1230,7 +1230,7 @@ func (a *AppState) subscribeVerifyHandler(w http.ResponseWriter, r *http.Request
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok":                true,
 		"service":           "vpn233-provider-server",
-		"version":           "1.1.0",
+		"version":           "1.2.0",
 		"git_root":          ctx.TopLevel,
 		"config_path":       a.cfgPath,
 		"config_format":     defaultServerConfigFile,
